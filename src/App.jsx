@@ -77,6 +77,21 @@ function parseInputValue(value, type) {
   return trimmed;
 }
 
+function parseDecimalWithExponent(value, exponent) {
+  const trimmed = value.trim();
+  if (!trimmed) return 0n;
+  if (!/^\d+(\.\d+)?$/.test(trimmed)) {
+    throw new Error("输入格式不正确，请输入数字。");
+  }
+  const [whole, fractionRaw = ""] = trimmed.split(".");
+  if (fractionRaw.length > exponent) {
+    throw new Error(`小数位过多，最多支持 ${exponent} 位。`);
+  }
+  const fraction = fractionRaw.padEnd(exponent, "0");
+  const combined = `${whole}${fraction}`;
+  return BigInt(combined);
+}
+
 function getFunctionSignature(fn) {
   const types = (fn.inputs || []).map((input) => input.type).join(",");
   return `${fn.name}(${types})`;
@@ -153,14 +168,17 @@ function MethodCard({
     try {
       const parsedArgs = (fn.inputs || []).map((input, index) => {
         const rawValue = params[index] || "";
-        const parsed = parseInputValue(rawValue, input.type);
-        if (SCALE_TYPES.has(input.type) && typeof parsed === "bigint") {
+        if (SCALE_TYPES.has(input.type)) {
           const exponent = Number(exponents[index] || 0);
           if (exponent > 0) {
-            return parsed * 10n ** BigInt(exponent);
+            return parseDecimalWithExponent(rawValue, exponent);
           }
+          if (rawValue.includes(".")) {
+            throw new Error("uint 类型不支持小数，请选择 10^n 或改用整数。");
+          }
+          return parseInputValue(rawValue, input.type);
         }
-        return parsed;
+        return parseInputValue(rawValue, input.type);
       });
 
       if (kind === "read") {
