@@ -105,6 +105,9 @@ async function retryCall(fn, attempts = 3, delayMs = 400) {
   throw lastError;
 }
 
+const EXPONENT_OPTIONS = [0, 6, 9, 12, 18, 24];
+const SCALE_TYPES = new Set(["uint256", "uint128"]);
+
 function MethodCard({
   fn,
   kind,
@@ -114,6 +117,9 @@ function MethodCard({
 }) {
   const [params, setParams] = useState(() =>
     (fn.inputs || []).map(() => "")
+  );
+  const [exponents, setExponents] = useState(() =>
+    (fn.inputs || []).map(() => 0)
   );
   const [payableValue, setPayableValue] = useState("");
   const [output, setOutput] = useState(
@@ -131,15 +137,31 @@ function MethodCard({
     });
   };
 
+  const handleExponentChange = (index, value) => {
+    setExponents((prev) => {
+      const next = [...prev];
+      next[index] = value;
+      return next;
+    });
+  };
+
   const handleCall = async () => {
     setLoading(true);
     setOutput(kind === "read" ? "正在调用..." : "正在发送交易...");
     setTxHash("");
 
     try {
-      const parsedArgs = (fn.inputs || []).map((input, index) =>
-        parseInputValue(params[index] || "", input.type)
-      );
+      const parsedArgs = (fn.inputs || []).map((input, index) => {
+        const rawValue = params[index] || "";
+        const parsed = parseInputValue(rawValue, input.type);
+        if (SCALE_TYPES.has(input.type) && typeof parsed === "bigint") {
+          const exponent = Number(exponents[index] || 0);
+          if (exponent > 0) {
+            return parsed * 10n ** BigInt(exponent);
+          }
+        }
+        return parsed;
+      });
 
       if (kind === "read") {
         const result = await onRead(fn, parsedArgs);
@@ -186,18 +208,48 @@ function MethodCard({
                 <label>
                   {input.name || `arg${index}`} ({input.type})
                 </label>
-                <input
-                  type="text"
-                  placeholder={
-                    input.type.includes("[]") || input.type.startsWith("tuple")
-                      ? "JSON 格式"
-                      : "输入参数"
-                  }
-                  value={params[index]}
-                  onChange={(event) =>
-                    handleParamChange(index, event.target.value)
-                  }
-                />
+                {SCALE_TYPES.has(input.type) ? (
+                  <div className="input-with-addon">
+                    <input
+                      type="text"
+                      placeholder={
+                        input.type.includes("[]") || input.type.startsWith("tuple")
+                          ? "JSON 格式"
+                          : "输入参数"
+                      }
+                      value={params[index]}
+                      onChange={(event) =>
+                        handleParamChange(index, event.target.value)
+                      }
+                    />
+                    <select
+                      className="addon-select"
+                      value={exponents[index]}
+                      onChange={(event) =>
+                        handleExponentChange(index, Number(event.target.value))
+                      }
+                    >
+                      {EXPONENT_OPTIONS.map((exp) => (
+                        <option key={exp} value={exp}>
+                          10^{exp}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                ) : (
+                  <input
+                    type="text"
+                    placeholder={
+                      input.type.includes("[]") || input.type.startsWith("tuple")
+                        ? "JSON 格式"
+                        : "输入参数"
+                    }
+                    value={params[index]}
+                    onChange={(event) =>
+                      handleParamChange(index, event.target.value)
+                    }
+                  />
+                )}
               </div>
             ))}
           </div>
@@ -261,6 +313,7 @@ export default function App() {
   const [abi, setAbi] = useState(null);
   const [readFns, setReadFns] = useState([]);
   const [writeFns, setWriteFns] = useState([]);
+  const [activeTab, setActiveTab] = useState("read");
   const [status, setStatus] = useState({ message: "", type: "" });
 
   const { isConnected } = useAccount();
@@ -472,6 +525,12 @@ export default function App() {
     updateStatus("已清空。", "");
   };
 
+  const activeList = activeTab === "read" ? readFns : writeFns;
+  const emptyText =
+    activeTab === "read"
+      ? "请先加载合约。"
+      : "加载合约后，这里会展示可写方法。";
+
   return (
     <div>
       <div className="bg-orb bg-orb-1"></div>
@@ -623,37 +682,36 @@ export default function App() {
         </section>
 
         <section className="content">
-          <div className="section-header">
-            <h2>Read 方法</h2>
-            <span className="pill">{readFns.length}</span>
-          </div>
-          <div className={`method-list ${readFns.length ? "" : "empty"}`}>
-            {readFns.length === 0
-              ? "请先加载合约。"
-              : readFns.map((fn) => (
-                  <MethodCard
-                    key={`read-${getFunctionSignature(fn)}`}
-                    fn={fn}
-                    kind="read"
-                    explorerBase={explorerBase}
-                    onRead={callReadWithFallback}
-                  />
-                ))}
+          <div className="tabs">
+            <button
+              className={`tab ${activeTab === "read" ? "active" : ""}`}
+              onClick={() => setActiveTab("read")}
+            >
+              Read Contract
+            </button>
+            <button
+              className={`tab ${activeTab === "write" ? "active" : ""}`}
+              onClick={() => setActiveTab("write")}
+            >
+              Write Contract
+            </button>
           </div>
 
-          <div className="section-header" style={{ marginTop: 28 }}>
-            <h2>Write 方法</h2>
-            <span className="pill">{writeFns.length}</span>
+          <div className="section-header">
+            <h2>{activeTab === "read" ? "Read 方法" : "Write 方法"}</h2>
+            <span className="pill">{activeList.length}</span>
           </div>
-          <div className={`method-list ${writeFns.length ? "" : "empty"}`}>
-            {writeFns.length === 0
-              ? "加载合约后，这里会展示可写方法。"
-              : writeFns.map((fn) => (
+
+          <div className={`method-list ${activeList.length ? "" : "empty"}`}>
+            {activeList.length === 0
+              ? emptyText
+              : activeList.map((fn) => (
                   <MethodCard
-                    key={`write-${getFunctionSignature(fn)}`}
+                    key={`${activeTab}-${getFunctionSignature(fn)}`}
                     fn={fn}
-                    kind="write"
+                    kind={activeTab}
                     explorerBase={explorerBase}
+                    onRead={callReadWithFallback}
                     onWrite={handleWrite}
                   />
                 ))}

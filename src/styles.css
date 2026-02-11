@@ -18,13 +18,25 @@
   box-sizing: border-box;
 }
 
+html,
+body,
+#root {
+  width: 100%;
+  max-width: 100%;
+}
+
+#root {
+  margin: 0 auto;
+  position: relative;
+}
+
 body {
   margin: 0;
   font-family: "Space Grotesk", sans-serif;
   color: var(--text);
   background: radial-gradient(circle at 20% 20%, #1b2644 0%, #0c111d 35%, #0b0f1c 100%);
   min-height: 100vh;
-  padding: 32px 32px 20px;
+  padding: 20px 16px 16px;
   overflow-x: hidden;
 }
 
@@ -52,10 +64,10 @@ body {
 
 .hero {
   display: flex;
-  justify-content: space-between;
-  align-items: center;
-  gap: 20px;
-  padding: 8px 0 28px;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 16px;
+  padding: 8px 0 20px;
   position: relative;
   z-index: 1;
 }
@@ -113,22 +125,24 @@ body {
 }
 
 .layout {
-  display: grid;
-  grid-template-columns: minmax(280px, 360px) 1fr;
-  gap: 28px;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
   position: relative;
   z-index: 1;
+  width: 100%;
 }
 
 .panel {
   background: var(--panel-soft);
   border: 1px solid var(--border);
-  border-radius: 18px;
-  padding: 22px;
+  border-radius: 16px;
+  padding: 18px;
   backdrop-filter: blur(10px);
   display: flex;
   flex-direction: column;
   gap: 14px;
+  width: 100%;
 }
 
 .panel h2 {
@@ -167,6 +181,7 @@ select {
   font-size: 0.9rem;
   outline: none;
   transition: border 0.2s ease, box-shadow 0.2s ease;
+  width: 100%;
 }
 
 input:focus,
@@ -229,10 +244,37 @@ select:focus {
 
 .content {
   background: rgba(9, 13, 24, 0.7);
-  border-radius: 18px;
+  border-radius: 16px;
   border: 1px solid var(--border);
-  padding: 20px 24px 28px;
+  padding: 18px;
   min-height: 520px;
+  width: 100%;
+}
+
+.tabs {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 16px;
+}
+
+.tab {
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text);
+  padding: 8px 16px;
+  border-radius: 999px;
+  cursor: pointer;
+  font-weight: 600;
+  font-size: 0.9rem;
+  transition: all 0.2s ease;
+}
+
+.tab.active {
+  background: linear-gradient(120deg, #f0b34f, #ffcc66);
+  color: #241500;
+  border-color: transparent;
+  box-shadow: 0 8px 16px rgba(240, 179, 79, 0.25);
 }
 
 .section-header {
@@ -277,8 +319,9 @@ select:focus {
   list-style: none;
   cursor: pointer;
   display: flex;
-  align-items: center;
-  justify-content: space-between;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
   font-size: 1rem;
   font-weight: 600;
   color: var(--text);
@@ -302,9 +345,9 @@ select:focus {
 }
 
 .param-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-  gap: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
 }
 
 .param {
@@ -316,6 +359,29 @@ select:focus {
 .param label {
   font-size: 0.8rem;
   color: var(--muted);
+}
+
+.input-with-addon {
+  position: relative;
+  width: 100%;
+}
+
+.input-with-addon input {
+  padding-right: 96px;
+}
+
+.addon-select {
+  position: absolute;
+  right: 6px;
+  top: 50%;
+  transform: translateY(-50%);
+  height: 30px;
+  width: 84px;
+  border-radius: 8px;
+  background: rgba(15, 22, 40, 0.85);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  font-size: 0.78rem;
+  padding: 2px 6px;
 }
 
 .output {
@@ -349,13 +415,46 @@ select:focus {
   text-align: center;
 }
 
-@media (max-width: 960px) {
-  .layout {
-    grid-template-columns: 1fr;
+@media (min-width: 960px) {
+  body {
+    padding: 32px 32px 24px;
   }
 
   .hero {
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+  }
+
+  .layout {
+    display: grid;
+    grid-template-columns: minmax(280px, 360px) 1fr;
+    gap: 28px;
+  }
+
+  .panel,
+  .content {
+    padding: 22px;
+  }
+
+  .method-card summary {
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+  }
+}
+
+@media (max-width: 560px) {
+  .actions {
     flex-direction: column;
-    align-items: flex-start;
+    align-items: stretch;
+  }
+
+  .btn {
+    width: 100%;
+  }
+
+  .wallet {
+    width: 100%;
   }
 }
