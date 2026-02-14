@@ -587,13 +587,17 @@ select:focus {
 
   .layout {
     display: grid;
-    grid-template-columns: minmax(280px, 360px) 1fr;
+    grid-template-columns: minmax(340px, 440px) 1fr;
     gap: 28px;
   }
 
   .panel,
   .content {
     padding: 22px;
+  }
+
+  .template-toolbar {
+    flex-wrap: nowrap;
   }
 
   .method-card summary {
