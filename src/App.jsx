@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { ConnectButton } from "@rainbow-me/rainbowkit";
 import { useAccount, useWalletClient } from "wagmi";
 import {
@@ -19,6 +19,11 @@ const DEFAULTS = {
   contractAddress: "0xAB5159B5655CdAA5178C283853841aBB0D02Eef9",
   abi: "",
 };
+
+const TEMPLATE_STORAGE_KEY = "common-evm-dashboard.templates.v1";
+const TEMPLATE_EXPORT_VERSION = 1;
+const EXPONENT_OPTIONS = [0, 6, 9, 12, 18, 24];
+const SCALE_TYPES = new Set(["uint256", "uint128"]);
 
 function shortAddress(address) {
   if (!address) return "";
@@ -98,7 +103,11 @@ function getFunctionSignature(fn) {
 }
 
 function isReadFunction(fn) {
-  return fn.stateMutability === "view" || fn.stateMutability === "pure" || fn.constant === true;
+  return (
+    fn.stateMutability === "view" ||
+    fn.stateMutability === "pure" ||
+    fn.constant === true
+  );
 }
 
 function sleep(ms) {
@@ -120,8 +129,119 @@ async function retryCall(fn, attempts = 3, delayMs = 400) {
   throw lastError;
 }
 
-const EXPONENT_OPTIONS = [0, 6, 9, 12, 18, 24];
-const SCALE_TYPES = new Set(["uint256", "uint128"]);
+function generateTemplateId() {
+  return `tpl_${Date.now()}_${Math.random().toString(16).slice(2, 10)}`;
+}
+
+function getCurrentIsoTime() {
+  return new Date().toISOString();
+}
+
+function buildMethodStorageKey(kind, fn) {
+  return `${kind}:${getFunctionSignature(fn)}`;
+}
+
+function normalizeMethodState(raw, inputLength) {
+  const safeRaw = raw && typeof raw === "object" ? raw : {};
+  const params = Array.isArray(safeRaw.params)
+    ? safeRaw.params.slice(0, inputLength).map((item) => String(item ?? ""))
+    : [];
+  const exponents = Array.isArray(safeRaw.exponents)
+    ? safeRaw.exponents
+        .slice(0, inputLength)
+        .map((item) => Number(item || 0))
+        .map((item) => (Number.isNaN(item) ? 0 : item))
+    : [];
+
+  while (params.length < inputLength) params.push("");
+  while (exponents.length < inputLength) exponents.push(0);
+
+  return {
+    params,
+    exponents,
+    payableValue: String(safeRaw.payableValue ?? ""),
+  };
+}
+
+function sanitizeMethodStates(raw) {
+  if (!raw || typeof raw !== "object") return {};
+  const next = {};
+  Object.entries(raw).forEach(([key, value]) => {
+    if (!value || typeof value !== "object") return;
+    const params = Array.isArray(value.params)
+      ? value.params.map((item) => String(item ?? ""))
+      : [];
+    const exponents = Array.isArray(value.exponents)
+      ? value.exponents
+          .map((item) => Number(item || 0))
+          .map((item) => (Number.isNaN(item) ? 0 : item))
+      : [];
+    next[key] = {
+      params,
+      exponents,
+      payableValue: String(value.payableValue ?? ""),
+    };
+  });
+  return next;
+}
+
+function cloneMethodStates(methodStates) {
+  return JSON.parse(JSON.stringify(methodStates || {}));
+}
+
+function normalizePanelValues(panel) {
+  return {
+    rpcListText: String(panel?.rpcListText ?? DEFAULTS.rpcList),
+    selectedRpc: String(panel?.selectedRpc ?? DEFAULTS.rpcList),
+    explorerBase: String(panel?.explorerBase ?? DEFAULTS.explorerBase),
+    explorerApi: String(panel?.explorerApi ?? DEFAULTS.explorerApi),
+    explorerApiKey: String(panel?.explorerApiKey ?? DEFAULTS.explorerApiKey),
+    chainId: String(panel?.chainId ?? DEFAULTS.chainId),
+    contractAddress: String(panel?.contractAddress ?? DEFAULTS.contractAddress),
+    abiText: String(panel?.abiText ?? DEFAULTS.abi),
+  };
+}
+
+function extractTemplateList(raw) {
+  if (Array.isArray(raw)) return raw;
+  if (raw && typeof raw === "object" && Array.isArray(raw.templates)) {
+    return raw.templates;
+  }
+  if (raw && typeof raw === "object") return [raw];
+  return [];
+}
+
+function sanitizeTemplate(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  const name = String(raw.name || "").trim();
+  if (!name) return null;
+
+  const panel = normalizePanelValues(raw.panel || {});
+  const now = getCurrentIsoTime();
+
+  return {
+    id: String(raw.id || generateTemplateId()),
+    name,
+    panel,
+    methodStates: sanitizeMethodStates(raw.methodStates),
+    createdAt: String(raw.createdAt || now),
+    updatedAt: String(raw.updatedAt || now),
+  };
+}
+
+function loadTemplatesFromStorage() {
+  try {
+    const raw = localStorage.getItem(TEMPLATE_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    const list = extractTemplateList(parsed)
+      .map(sanitizeTemplate)
+      .filter(Boolean);
+    return list;
+  } catch {
+    return [];
+  }
+}
 
 function MethodCard({
   fn,
@@ -129,20 +249,41 @@ function MethodCard({
   explorerBase,
   onRead,
   onWrite,
+  onPersist,
+  methodStorageKey,
+  savedCallState,
 }) {
-  const [params, setParams] = useState(() =>
-    (fn.inputs || []).map(() => "")
+  const inputLength = fn.inputs?.length || 0;
+  const normalizedSavedCallState = useMemo(
+    () => normalizeMethodState(savedCallState, inputLength),
+    [savedCallState, inputLength]
   );
-  const [exponents, setExponents] = useState(() =>
-    (fn.inputs || []).map(() => 0)
+
+  const [params, setParams] = useState(normalizedSavedCallState.params);
+  const [exponents, setExponents] = useState(normalizedSavedCallState.exponents);
+  const [payableValue, setPayableValue] = useState(
+    normalizedSavedCallState.payableValue
   );
-  const [payableValue, setPayableValue] = useState("");
   const [output, setOutput] = useState(
     kind === "read" ? "调用结果将在此显示" : "交易状态将在此显示"
   );
   const [txHash, setTxHash] = useState("");
   const [loading, setLoading] = useState(false);
   const signature = getFunctionSignature(fn);
+
+  useEffect(() => {
+    setParams(normalizedSavedCallState.params);
+    setExponents(normalizedSavedCallState.exponents);
+    setPayableValue(normalizedSavedCallState.payableValue);
+  }, [normalizedSavedCallState]);
+
+  const persistCurrentInputs = () => {
+    onPersist(methodStorageKey, {
+      params: [...params],
+      exponents: [...exponents],
+      payableValue,
+    });
+  };
 
   const handleParamChange = (index, value) => {
     setParams((prev) => {
@@ -161,6 +302,7 @@ function MethodCard({
   };
 
   const handleCall = async () => {
+    persistCurrentInputs();
     setLoading(true);
     setOutput(kind === "read" ? "正在调用..." : "正在发送交易...");
     setTxHash("");
@@ -187,11 +329,7 @@ function MethodCard({
         return;
       }
 
-      const { hash, receiptPromise } = await onWrite(
-        fn,
-        parsedArgs,
-        payableValue
-      );
+      const { hash, receiptPromise } = await onWrite(fn, parsedArgs, payableValue);
       setTxHash(hash);
       setOutput("交易已发送，等待钱包确认...");
 
@@ -286,11 +424,7 @@ function MethodCard({
         )}
 
         <div className="actions">
-          <button
-            className="btn secondary"
-            onClick={handleCall}
-            disabled={loading}
-          >
+          <button className="btn secondary" onClick={handleCall} disabled={loading}>
             {kind === "read" ? "调用" : "发起交易"}
           </button>
         </div>
@@ -324,9 +458,7 @@ export default function App() {
   const [explorerApi, setExplorerApi] = useState(DEFAULTS.explorerApi);
   const [explorerApiKey, setExplorerApiKey] = useState(DEFAULTS.explorerApiKey);
   const [chainId, setChainId] = useState(DEFAULTS.chainId);
-  const [contractAddress, setContractAddress] = useState(
-    DEFAULTS.contractAddress
-  );
+  const [contractAddress, setContractAddress] = useState(DEFAULTS.contractAddress);
   const [abiText, setAbiText] = useState(DEFAULTS.abi);
   const [abi, setAbi] = useState(null);
   const [readFns, setReadFns] = useState([]);
@@ -334,19 +466,50 @@ export default function App() {
   const [activeTab, setActiveTab] = useState("read");
   const [status, setStatus] = useState({ message: "", type: "" });
 
+  const [templates, setTemplates] = useState([]);
+  const [activeTemplateId, setActiveTemplateId] = useState("");
+  const [templateNameInput, setTemplateNameInput] = useState("");
+  const [methodDrafts, setMethodDrafts] = useState({});
+  const [isTemplateMenuOpen, setIsTemplateMenuOpen] = useState(false);
+  const [isExportModalOpen, setIsExportModalOpen] = useState(false);
+  const [exportSelection, setExportSelection] = useState({});
+
   const { isConnected } = useAccount();
   const { data: walletClient } = useWalletClient();
 
-  const rpcOptions = useMemo(
-    () => parseRpcList(rpcListText),
-    [rpcListText]
+  const templateMenuRef = useRef(null);
+  const importInputRef = useRef(null);
+
+  const rpcOptions = useMemo(() => parseRpcList(rpcListText), [rpcListText]);
+  const activeTemplate = useMemo(
+    () => templates.find((item) => item.id === activeTemplateId) || null,
+    [templates, activeTemplateId]
   );
+
+  useEffect(() => {
+    setTemplates(loadTemplatesFromStorage());
+  }, []);
 
   useEffect(() => {
     if (!selectedRpc || !rpcOptions.includes(selectedRpc)) {
       setSelectedRpc(rpcOptions[0] || "");
     }
   }, [rpcOptions, selectedRpc]);
+
+  useEffect(() => {
+    if (!isTemplateMenuOpen) return undefined;
+
+    const handleOutsideClick = (event) => {
+      if (templateMenuRef.current && !templateMenuRef.current.contains(event.target)) {
+        setIsTemplateMenuOpen(false);
+      }
+    };
+
+    document.addEventListener("mousedown", handleOutsideClick);
+    return () => {
+      document.removeEventListener("mousedown", handleOutsideClick);
+    };
+  }, [isTemplateMenuOpen]);
 
   const publicClient = useMemo(() => {
     if (!selectedRpc) return null;
@@ -355,6 +518,38 @@ export default function App() {
 
   const updateStatus = (message, type = "") => {
     setStatus({ message, type });
+  };
+
+  const getCurrentPanelValues = () => ({
+    rpcListText,
+    selectedRpc,
+    explorerBase,
+    explorerApi,
+    explorerApiKey,
+    chainId,
+    contractAddress,
+    abiText,
+  });
+
+  const applyPanelValues = (panel) => {
+    const normalized = normalizePanelValues(panel);
+    setRpcListText(normalized.rpcListText);
+    setSelectedRpc(normalized.selectedRpc);
+    setExplorerBase(normalized.explorerBase);
+    setExplorerApi(normalized.explorerApi);
+    setExplorerApiKey(normalized.explorerApiKey);
+    setChainId(normalized.chainId);
+    setContractAddress(normalized.contractAddress);
+    setAbiText(normalized.abiText);
+  };
+
+  const persistTemplates = (updater) => {
+    setTemplates((prevTemplates) => {
+      const nextTemplates =
+        typeof updater === "function" ? updater(prevTemplates) : updater;
+      localStorage.setItem(TEMPLATE_STORAGE_KEY, JSON.stringify(nextTemplates));
+      return nextTemplates;
+    });
   };
 
   const fetchAbiFromExplorer = async (address) => {
@@ -528,6 +723,233 @@ export default function App() {
     }
   };
 
+  const handlePersistMethodState = (methodKey, nextState) => {
+    const safeState = {
+      params: Array.isArray(nextState?.params)
+        ? nextState.params.map((item) => String(item ?? ""))
+        : [],
+      exponents: Array.isArray(nextState?.exponents)
+        ? nextState.exponents
+            .map((item) => Number(item || 0))
+            .map((item) => (Number.isNaN(item) ? 0 : item))
+        : [],
+      payableValue: String(nextState?.payableValue ?? ""),
+    };
+
+    setMethodDrafts((prev) => ({
+      ...prev,
+      [methodKey]: safeState,
+    }));
+
+    if (!activeTemplateId) return;
+
+    persistTemplates((prevTemplates) =>
+      prevTemplates.map((template) => {
+        if (template.id !== activeTemplateId) return template;
+        return {
+          ...template,
+          methodStates: {
+            ...(template.methodStates || {}),
+            [methodKey]: safeState,
+          },
+          updatedAt: getCurrentIsoTime(),
+        };
+      })
+    );
+  };
+
+  const handleSelectTemplate = (templateId) => {
+    const template = templates.find((item) => item.id === templateId);
+    if (!template) return;
+
+    applyPanelValues(template.panel);
+    setMethodDrafts(cloneMethodStates(template.methodStates));
+    setTemplateNameInput(template.name);
+    setActiveTemplateId(template.id);
+    setIsTemplateMenuOpen(false);
+    updateStatus(`已加载模板：${template.name}`, "success");
+  };
+
+  const handleDeleteTemplate = (templateId) => {
+    const template = templates.find((item) => item.id === templateId);
+    if (!template) return;
+
+    const confirmed = window.confirm(`确认删除模板「${template.name}」？`);
+    if (!confirmed) return;
+
+    persistTemplates((prevTemplates) =>
+      prevTemplates.filter((item) => item.id !== templateId)
+    );
+
+    if (activeTemplateId === templateId) {
+      setActiveTemplateId("");
+      setTemplateNameInput("");
+      setMethodDrafts({});
+    }
+
+    updateStatus(`已删除模板：${template.name}`, "success");
+  };
+
+  const handleSaveOrUpdateTemplate = () => {
+    const currentPanel = getCurrentPanelValues();
+    const now = getCurrentIsoTime();
+
+    if (activeTemplate) {
+      const nextName = templateNameInput.trim() || activeTemplate.name;
+      persistTemplates((prevTemplates) =>
+        prevTemplates.map((item) => {
+          if (item.id !== activeTemplate.id) return item;
+          return {
+            ...item,
+            name: nextName,
+            panel: currentPanel,
+            methodStates: cloneMethodStates(methodDrafts),
+            updatedAt: now,
+          };
+        })
+      );
+      setTemplateNameInput(nextName);
+      updateStatus(`模板已更新：${nextName}`, "success");
+      return;
+    }
+
+    const nameFromInput = templateNameInput.trim();
+    const name = nameFromInput || window.prompt("请输入模板名称") || "";
+    const finalName = name.trim();
+    if (!finalName) {
+      updateStatus("模板名称不能为空。", "error");
+      return;
+    }
+
+    const nextTemplate = {
+      id: generateTemplateId(),
+      name: finalName,
+      panel: currentPanel,
+      methodStates: cloneMethodStates(methodDrafts),
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    persistTemplates((prevTemplates) => [...prevTemplates, nextTemplate]);
+    setActiveTemplateId(nextTemplate.id);
+    setTemplateNameInput(finalName);
+    updateStatus(`模板已保存：${finalName}`, "success");
+  };
+
+  const handleImportTemplates = async (event) => {
+    const files = Array.from(event.target.files || []);
+    event.target.value = "";
+
+    if (!files.length) return;
+
+    const importedTemplates = [];
+    let invalidFiles = 0;
+
+    for (const file of files) {
+      try {
+        const text = await file.text();
+        const parsed = JSON.parse(text);
+        const list = extractTemplateList(parsed);
+        const sanitized = list.map(sanitizeTemplate).filter(Boolean);
+        importedTemplates.push(...sanitized);
+      } catch {
+        invalidFiles += 1;
+      }
+    }
+
+    if (!importedTemplates.length) {
+      updateStatus("导入失败：未读取到有效模板。", "error");
+      return;
+    }
+
+    persistTemplates((prevTemplates) => {
+      const usedIds = new Set(prevTemplates.map((item) => item.id));
+      const nextTemplates = [...prevTemplates];
+
+      importedTemplates.forEach((template) => {
+        let nextId = template.id;
+        while (usedIds.has(nextId)) {
+          nextId = generateTemplateId();
+        }
+        usedIds.add(nextId);
+        nextTemplates.push({ ...template, id: nextId, updatedAt: getCurrentIsoTime() });
+      });
+
+      return nextTemplates;
+    });
+
+    const invalidMessage = invalidFiles
+      ? `，${invalidFiles} 个文件解析失败`
+      : "";
+    updateStatus(`成功导入 ${importedTemplates.length} 个模板${invalidMessage}。`, "success");
+  };
+
+  const openExportModal = () => {
+    if (!templates.length) {
+      updateStatus("当前没有可导出的模板。", "error");
+      return;
+    }
+
+    const nextSelection = {};
+    templates.forEach((template) => {
+      nextSelection[template.id] = false;
+    });
+
+    setExportSelection(nextSelection);
+    setIsExportModalOpen(true);
+  };
+
+  const handleToggleExportTemplate = (templateId) => {
+    setExportSelection((prev) => ({
+      ...prev,
+      [templateId]: !prev[templateId],
+    }));
+  };
+
+  const handleToggleExportAll = () => {
+    const allChecked = templates.length > 0 &&
+      templates.every((template) => exportSelection[template.id]);
+
+    const nextSelection = {};
+    templates.forEach((template) => {
+      nextSelection[template.id] = !allChecked;
+    });
+    setExportSelection(nextSelection);
+  };
+
+  const handleConfirmExport = () => {
+    const selectedTemplates = templates.filter(
+      (template) => exportSelection[template.id]
+    );
+
+    if (!selectedTemplates.length) {
+      updateStatus("请至少选择一个模板进行导出。", "error");
+      return;
+    }
+
+    const payload = {
+      version: TEMPLATE_EXPORT_VERSION,
+      exportedAt: getCurrentIsoTime(),
+      templates: selectedTemplates,
+    };
+
+    const blob = new Blob([JSON.stringify(payload, null, 2)], {
+      type: "application/json",
+    });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    const filename = `contract-templates-${Date.now()}.json`;
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+
+    setIsExportModalOpen(false);
+    updateStatus(`已导出 ${selectedTemplates.length} 个模板。`, "success");
+  };
+
   const resetAll = () => {
     setRpcListText("");
     setSelectedRpc("");
@@ -540,6 +962,7 @@ export default function App() {
     setAbi(null);
     setReadFns([]);
     setWriteFns([]);
+    setMethodDrafts({});
     updateStatus("已清空。", "");
   };
 
@@ -570,9 +993,7 @@ export default function App() {
             return (
               <div className="wallet">
                 <div className="wallet-status">
-                  <span
-                    className={`dot ${connected ? "online" : ""}`}
-                  ></span>
+                  <span className={`dot ${connected ? "online" : ""}`}></span>
                   <span id="walletText">{label}</span>
                 </div>
 
@@ -598,6 +1019,83 @@ export default function App() {
       <main className="layout">
         <section className="panel">
           <h2>基础配置</h2>
+
+          <div className="template-toolbar">
+            <div className="template-picker" ref={templateMenuRef}>
+              <button
+                className="template-trigger"
+                type="button"
+                onClick={() => setIsTemplateMenuOpen((prev) => !prev)}
+              >
+                {activeTemplate ? activeTemplate.name : "选择模板"}
+              </button>
+
+              {isTemplateMenuOpen && (
+                <div className="template-menu">
+                  {templates.length === 0 ? (
+                    <div className="template-empty">暂无模板</div>
+                  ) : (
+                    templates.map((template) => (
+                      <div
+                        className={`template-item ${template.id === activeTemplateId ? "active" : ""}`}
+                        key={template.id}
+                      >
+                        <button
+                          className="template-item-main"
+                          type="button"
+                          onClick={() => handleSelectTemplate(template.id)}
+                        >
+                          {template.name}
+                        </button>
+                        <button
+                          className="template-delete"
+                          type="button"
+                          onClick={() => handleDeleteTemplate(template.id)}
+                          title="删除模板"
+                        >
+                          x
+                        </button>
+                      </div>
+                    ))
+                  )}
+                </div>
+              )}
+            </div>
+
+            <button
+              className="btn ghost small-btn"
+              type="button"
+              onClick={() => importInputRef.current?.click()}
+            >
+              导入
+            </button>
+            <button
+              className="btn ghost small-btn"
+              type="button"
+              onClick={openExportModal}
+            >
+              导出
+            </button>
+            <input
+              ref={importInputRef}
+              type="file"
+              accept="application/json,.json"
+              multiple
+              onChange={handleImportTemplates}
+              style={{ display: "none" }}
+            />
+          </div>
+
+          <label className="field">
+            <span>模板名称（用于保存/修改）</span>
+            <input
+              type="text"
+              value={templateNameInput}
+              placeholder="输入模板名称"
+              onChange={(event) => setTemplateNameInput(event.target.value)}
+            />
+          </label>
+
           <label className="field">
             <span>RPC 端点列表（一行一个）</span>
             <textarea
@@ -614,9 +1112,7 @@ export default function App() {
               value={selectedRpc}
               onChange={(event) => setSelectedRpc(event.target.value)}
             >
-              {rpcOptions.length === 0 && (
-                <option value="">请先填写 RPC</option>
-              )}
+              {rpcOptions.length === 0 && <option value="">请先填写 RPC</option>}
               {rpcOptions.map((rpc, index) => (
                 <option value={rpc} key={rpc}>
                   {index + 1}. {rpc}
@@ -691,6 +1187,9 @@ export default function App() {
             <button className="btn primary" onClick={loadContract}>
               加载合约
             </button>
+            <button className="btn secondary" onClick={handleSaveOrUpdateTemplate}>
+              {activeTemplate ? "更新模板" : "保存模板"}
+            </button>
             <button className="btn ghost" onClick={resetAll}>
               清空
             </button>
@@ -723,19 +1222,62 @@ export default function App() {
           <div className={`method-list ${activeList.length ? "" : "empty"}`}>
             {activeList.length === 0
               ? emptyText
-              : activeList.map((fn) => (
-                  <MethodCard
-                    key={`${activeTab}-${getFunctionSignature(fn)}`}
-                    fn={fn}
-                    kind={activeTab}
-                    explorerBase={explorerBase}
-                    onRead={callReadWithFallback}
-                    onWrite={handleWrite}
-                  />
-                ))}
+              : activeList.map((fn) => {
+                  const methodStorageKey = buildMethodStorageKey(activeTab, fn);
+                  return (
+                    <MethodCard
+                      key={methodStorageKey}
+                      fn={fn}
+                      kind={activeTab}
+                      explorerBase={explorerBase}
+                      onRead={callReadWithFallback}
+                      onWrite={handleWrite}
+                      onPersist={handlePersistMethodState}
+                      methodStorageKey={methodStorageKey}
+                      savedCallState={methodDrafts[methodStorageKey]}
+                    />
+                  );
+                })}
           </div>
         </section>
       </main>
+
+      {isExportModalOpen && (
+        <div className="modal-overlay">
+          <div className="modal-card">
+            <h3>导出模板</h3>
+            <button className="link-btn" type="button" onClick={handleToggleExportAll}>
+              全部选择 / 取消全选
+            </button>
+
+            <div className="export-list">
+              {templates.map((template) => (
+                <label className="export-item" key={template.id}>
+                  <input
+                    type="checkbox"
+                    checked={Boolean(exportSelection[template.id])}
+                    onChange={() => handleToggleExportTemplate(template.id)}
+                  />
+                  <span>{template.name}</span>
+                </label>
+              ))}
+            </div>
+
+            <div className="actions">
+              <button className="btn primary" type="button" onClick={handleConfirmExport}>
+                导出选中
+              </button>
+              <button
+                className="btn ghost"
+                type="button"
+                onClick={() => setIsExportModalOpen(false)}
+              >
+                取消
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       <footer className="footer">
         提示：Read 方法不需要钱包即可调用，Write 方法需连接钱包并签名。

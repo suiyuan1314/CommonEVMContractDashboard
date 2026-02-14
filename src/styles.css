@@ -197,6 +197,103 @@ select:focus {
   flex-wrap: wrap;
 }
 
+.template-toolbar {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.template-picker {
+  position: relative;
+  flex: 1 1 220px;
+}
+
+.template-trigger {
+  width: 100%;
+  text-align: left;
+  background: rgba(10, 14, 26, 0.7);
+  border: 1px solid transparent;
+  border-radius: 10px;
+  color: var(--text);
+  padding: 10px 12px;
+  font-family: "JetBrains Mono", monospace;
+  font-size: 0.9rem;
+  cursor: pointer;
+}
+
+.template-trigger:focus,
+.template-trigger:hover {
+  border-color: rgba(240, 179, 79, 0.6);
+}
+
+.template-menu {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: calc(100% + 8px);
+  background: rgba(13, 19, 35, 0.98);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 6px;
+  z-index: 20;
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+.template-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px;
+  border-radius: 8px;
+}
+
+.template-item.active {
+  background: rgba(240, 179, 79, 0.16);
+}
+
+.template-item-main {
+  flex: 1;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+  padding: 6px 8px;
+  cursor: pointer;
+  border-radius: 6px;
+}
+
+.template-item-main:hover {
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.template-delete {
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--muted);
+  width: 22px;
+  height: 22px;
+  border-radius: 999px;
+  cursor: pointer;
+  font-size: 0.8rem;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.template-delete:hover {
+  border-color: rgba(255, 107, 107, 0.6);
+  color: var(--danger);
+}
+
+.template-empty {
+  color: var(--muted);
+  font-size: 0.86rem;
+  padding: 10px;
+}
+
 .btn {
   border: none;
   border-radius: 10px;
@@ -226,6 +323,11 @@ select:focus {
 
 .btn:active {
   transform: translateY(1px);
+}
+
+.small-btn {
+  width: auto;
+  min-width: 78px;
 }
 
 .status {
@@ -415,6 +517,63 @@ select:focus {
   text-align: center;
 }
 
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(5, 8, 18, 0.72);
+  backdrop-filter: blur(2px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 18px;
+  z-index: 60;
+}
+
+.modal-card {
+  width: min(520px, 100%);
+  background: rgba(15, 22, 40, 0.98);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 18px;
+}
+
+.modal-card h3 {
+  margin: 0 0 12px;
+}
+
+.link-btn {
+  border: none;
+  background: transparent;
+  color: var(--accent-strong);
+  cursor: pointer;
+  padding: 0;
+  margin-bottom: 12px;
+  font-size: 0.9rem;
+}
+
+.export-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 260px;
+  overflow-y: auto;
+  padding: 6px 4px 6px 0;
+  margin-bottom: 12px;
+}
+
+.export-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--text);
+}
+
+.export-item input {
+  width: 16px;
+  height: 16px;
+  flex: 0 0 auto;
+}
+
 @media (min-width: 960px) {
   body {
     padding: 32px 32px 24px;
@@ -452,6 +611,15 @@ select:focus {
 
   .btn {
     width: 100%;
+  }
+
+  .small-btn {
+    width: calc(50% - 5px);
+    min-width: 0;
+  }
+
+  .template-picker {
+    flex: 1 1 100%;
   }
 
   .wallet {
