@@ -1,8 +1,10 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { ConnectButton } from "@rainbow-me/rainbowkit";
-import { useAccount, useWalletClient } from "wagmi";
+import { useAccount, useChainId, useWalletClient } from "wagmi";
 import {
   createPublicClient,
+  createWalletClient,
+  custom,
   decodeFunctionResult,
   encodeFunctionData,
   http,
@@ -35,6 +37,14 @@ function parseRpcList(text) {
     .split("\n")
     .map((item) => item.trim())
     .filter(Boolean);
+}
+
+function parseChainIdValue(raw) {
+  const value = String(raw ?? "").trim();
+  if (!value) return null;
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed <= 0) return null;
+  return parsed;
 }
 
 function formatValue(value) {
@@ -93,8 +103,7 @@ function parseDecimalWithExponent(value, exponent) {
     throw new Error(`小数位过多，最多支持 ${exponent} 位。`);
   }
   const fraction = fractionRaw.padEnd(exponent, "0");
-  const combined = `${whole}${fraction}`;
-  return BigInt(combined);
+  return BigInt(`${whole}${fraction}`);
 }
 
 function getFunctionSignature(fn) {
@@ -141,52 +150,407 @@ function buildMethodStorageKey(kind, fn) {
   return `${kind}:${getFunctionSignature(fn)}`;
 }
 
-function normalizeMethodState(raw, inputLength) {
+function isExpandableTuple(param) {
+  return (
+    typeof param?.type === "string" &&
+    param.type === "tuple" &&
+    Array.isArray(param.components) &&
+    param.components.length > 0
+  );
+}
+
+function isTupleArrayParam(param) {
+  return (
+    typeof param?.type === "string" &&
+    param.type === "tuple[]" &&
+    Array.isArray(param.components) &&
+    param.components.length > 0
+  );
+}
+
+function buildParamNodes(params, path = [], useRelativePath = false) {
+  return (params || []).map((param, index) => {
+    const currentPath = useRelativePath ? [...path, index] : [...path, index];
+    const key = currentPath.join(".");
+    const name = param?.name || `arg${index}`;
+
+    if (isTupleArrayParam(param)) {
+      return {
+        kind: "tupleArray",
+        key,
+        name,
+        type: param.type,
+        path: currentPath,
+        children: buildParamNodes(param.components, [], true),
+      };
+    }
+
+    if (isExpandableTuple(param)) {
+      return {
+        kind: "tuple",
+        key,
+        name,
+        type: param.type,
+        path: currentPath,
+        children: buildParamNodes(param.components, currentPath, useRelativePath),
+      };
+    }
+
+    return {
+      kind: "leaf",
+      key,
+      name,
+      type: param?.type || "unknown",
+      path: currentPath,
+      components: Array.isArray(param?.components) ? param.components : null,
+    };
+  });
+}
+
+function toInputString(value) {
+  if (value === undefined || value === null) return "";
+  if (typeof value === "string") return value;
+  if (typeof value === "object") {
+    try {
+      return JSON.stringify(value);
+    } catch {
+      return String(value);
+    }
+  }
+  return String(value);
+}
+
+function getTupleChildValue(tupleValue, child, index) {
+  if (Array.isArray(tupleValue)) {
+    return tupleValue[index];
+  }
+  if (tupleValue && typeof tupleValue === "object") {
+    if (child.name && Object.prototype.hasOwnProperty.call(tupleValue, child.name)) {
+      return tupleValue[child.name];
+    }
+    return tupleValue[index];
+  }
+  return undefined;
+}
+
+function fillValuesFromNodes(nodes, tupleValue, targetValues) {
+  nodes.forEach((child, index) => {
+    const nextValue = getTupleChildValue(tupleValue, child, index);
+    if (nextValue === undefined || nextValue === null) return;
+
+    if (child.kind === "leaf") {
+      targetValues[child.key] = toInputString(nextValue);
+      return;
+    }
+
+    if (child.kind === "tuple") {
+      fillValuesFromNodes(child.children, nextValue, targetValues);
+    }
+  });
+}
+
+function fillValuesFromTupleNode(node, tupleValue, targetValues) {
+  if (!node || node.kind !== "tuple") return;
+  fillValuesFromNodes(node.children, tupleValue, targetValues);
+}
+
+function applyLeafDefaults(nodes, values, exponents) {
+  nodes.forEach((node) => {
+    if (node.kind === "leaf") {
+      if (values[node.key] === undefined) {
+        values[node.key] = "";
+      }
+      if (SCALE_TYPES.has(node.type)) {
+        const exponent = Number(exponents[node.key] || 0);
+        exponents[node.key] = Number.isNaN(exponent) ? 0 : exponent;
+      }
+      return;
+    }
+
+    if (node.kind === "tupleArray") {
+      return;
+    }
+
+    applyLeafDefaults(node.children, values, exponents);
+  });
+}
+
+function sanitizeTupleArrayRow(rawRow) {
+  const safeRow =
+    rawRow && typeof rawRow === "object" && !Array.isArray(rawRow) ? rawRow : {};
+
+  const values = {};
+  const rawValues =
+    safeRow.values && typeof safeRow.values === "object" && !Array.isArray(safeRow.values)
+      ? safeRow.values
+      : safeRow;
+  Object.entries(rawValues).forEach(([key, value]) => {
+    if (key === "values" || key === "exponents") return;
+    values[key] = String(value ?? "");
+  });
+
+  const exponents = {};
+  if (safeRow.exponents && typeof safeRow.exponents === "object") {
+    Object.entries(safeRow.exponents).forEach(([key, value]) => {
+      const parsed = Number(value || 0);
+      exponents[key] = Number.isNaN(parsed) ? 0 : parsed;
+    });
+  }
+
+  return { values, exponents };
+}
+
+function sanitizeTupleArrayMap(rawTupleArrays) {
+  if (
+    !rawTupleArrays ||
+    typeof rawTupleArrays !== "object" ||
+    Array.isArray(rawTupleArrays)
+  ) {
+    return {};
+  }
+
+  const next = {};
+  Object.entries(rawTupleArrays).forEach(([key, rows]) => {
+    if (!Array.isArray(rows)) return;
+    next[key] = rows.map((row) => sanitizeTupleArrayRow(row));
+  });
+  return next;
+}
+
+function parseJsonIfPossible(value) {
+  if (typeof value !== "string") return value;
+  const trimmed = value.trim();
+  if (!trimmed) return undefined;
+
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    return undefined;
+  }
+}
+
+function createTupleArrayRowDraft(node, tupleValue) {
+  const values = {};
+  const exponents = {};
+  applyLeafDefaults(node.children, values, exponents);
+  if (tupleValue !== undefined) {
+    fillValuesFromNodes(node.children, tupleValue, values);
+  }
+  return { values, exponents };
+}
+
+function createTupleArrayRowsFromValue(node, tupleArrayValue) {
+  if (!Array.isArray(tupleArrayValue)) return [];
+  return tupleArrayValue.map((rowValue) => createTupleArrayRowDraft(node, rowValue));
+}
+
+function collectTupleArrayNodes(nodes, target = []) {
+  nodes.forEach((node) => {
+    if (node.kind === "tupleArray") {
+      target.push(node);
+    }
+    if (node.kind === "tuple") {
+      collectTupleArrayNodes(node.children, target);
+    }
+  });
+  return target;
+}
+
+function sanitizeMethodState(raw) {
   const safeRaw = raw && typeof raw === "object" ? raw : {};
-  const params = Array.isArray(safeRaw.params)
-    ? safeRaw.params.slice(0, inputLength).map((item) => String(item ?? ""))
-    : [];
-  const exponents = Array.isArray(safeRaw.exponents)
-    ? safeRaw.exponents
-        .slice(0, inputLength)
-        .map((item) => Number(item || 0))
-        .map((item) => (Number.isNaN(item) ? 0 : item))
-    : [];
 
-  while (params.length < inputLength) params.push("");
-  while (exponents.length < inputLength) exponents.push(0);
+  const values = {};
+  if (safeRaw.values && typeof safeRaw.values === "object" && !Array.isArray(safeRaw.values)) {
+    Object.entries(safeRaw.values).forEach(([key, value]) => {
+      values[key] = String(value ?? "");
+    });
+  }
 
-  return {
-    params,
+  const exponents = {};
+  if (
+    safeRaw.exponents &&
+    typeof safeRaw.exponents === "object" &&
+    !Array.isArray(safeRaw.exponents)
+  ) {
+    Object.entries(safeRaw.exponents).forEach(([key, value]) => {
+      const parsed = Number(value || 0);
+      exponents[key] = Number.isNaN(parsed) ? 0 : parsed;
+    });
+  }
+
+  const sanitized = {
+    values,
     exponents,
+    tupleArrays: sanitizeTupleArrayMap(safeRaw.tupleArrays),
     payableValue: String(safeRaw.payableValue ?? ""),
   };
+
+  if (Array.isArray(safeRaw.params)) {
+    sanitized.params = safeRaw.params.map((item) => toInputString(item));
+  }
+
+  if (Array.isArray(safeRaw.legacyExponents)) {
+    sanitized.legacyExponents = safeRaw.legacyExponents
+      .map((item) => Number(item || 0))
+      .map((item) => (Number.isNaN(item) ? 0 : item));
+  } else if (Array.isArray(safeRaw.exponents)) {
+    sanitized.legacyExponents = safeRaw.exponents
+      .map((item) => Number(item || 0))
+      .map((item) => (Number.isNaN(item) ? 0 : item));
+  }
+
+  return sanitized;
+}
+
+function normalizeMethodDraftState(raw, nodes) {
+  const safeRaw = sanitizeMethodState(raw);
+  const values = { ...safeRaw.values };
+  const exponents = { ...safeRaw.exponents };
+  const tupleArrays = {};
+  Object.entries(safeRaw.tupleArrays || {}).forEach(([key, rows]) => {
+    tupleArrays[key] = rows.map((row) => ({
+      values: { ...(row.values || {}) },
+      exponents: { ...(row.exponents || {}) },
+    }));
+  });
+  const tupleArrayNodes = collectTupleArrayNodes(nodes);
+
+  if (Array.isArray(safeRaw.params) && safeRaw.params.length) {
+    nodes.forEach((node, index) => {
+      const legacyValue = safeRaw.params[index];
+      if (legacyValue === undefined) return;
+
+      if (node.kind === "leaf") {
+        values[node.key] = toInputString(legacyValue);
+        return;
+      }
+
+      const parsedValue = parseJsonIfPossible(legacyValue) ?? legacyValue;
+
+      if (node.kind === "tuple") {
+        fillValuesFromTupleNode(node, parsedValue, values);
+        return;
+      }
+
+      if (
+        node.kind === "tupleArray" &&
+        !Object.prototype.hasOwnProperty.call(tupleArrays, node.key)
+      ) {
+        tupleArrays[node.key] = createTupleArrayRowsFromValue(node, parsedValue);
+      }
+    });
+  }
+
+  tupleArrayNodes.forEach((node) => {
+    if (Object.prototype.hasOwnProperty.call(tupleArrays, node.key)) return;
+
+    const legacyValue = values[node.key];
+    if (legacyValue === undefined) return;
+    const parsedValue = parseJsonIfPossible(legacyValue);
+    if (Array.isArray(parsedValue)) {
+      tupleArrays[node.key] = createTupleArrayRowsFromValue(node, parsedValue);
+    }
+    delete values[node.key];
+  });
+
+  if (Array.isArray(safeRaw.legacyExponents) && safeRaw.legacyExponents.length) {
+    nodes.forEach((node, index) => {
+      if (node.kind !== "leaf") return;
+      if (!SCALE_TYPES.has(node.type)) return;
+      const exponent = Number(safeRaw.legacyExponents[index] || 0);
+      exponents[node.key] = Number.isNaN(exponent) ? 0 : exponent;
+    });
+  }
+
+  applyLeafDefaults(nodes, values, exponents);
+  tupleArrayNodes.forEach((node) => {
+    const hasRows = Object.prototype.hasOwnProperty.call(tupleArrays, node.key);
+    if (!hasRows) {
+      tupleArrays[node.key] = [createTupleArrayRowDraft(node)];
+      return;
+    }
+
+    const rows = Array.isArray(tupleArrays[node.key]) ? tupleArrays[node.key] : [];
+    tupleArrays[node.key] = rows.map((row) => {
+      const safeRow = sanitizeTupleArrayRow(row);
+      applyLeafDefaults(node.children, safeRow.values, safeRow.exponents);
+      return safeRow;
+    });
+  });
+
+  return {
+    values,
+    exponents,
+    tupleArrays,
+    payableValue: safeRaw.payableValue,
+  };
+}
+
+function buildChildrenCallValue(children, values, exponents, tupleArrays) {
+  const useObject = children.every((child) => Boolean(child.name));
+
+  if (useObject) {
+    const nextObject = {};
+    children.forEach((child, index) => {
+      const childValue = buildNodeCallValue(child, values, exponents, tupleArrays);
+      if (child.name) {
+        nextObject[child.name] = childValue;
+      } else {
+        nextObject[index] = childValue;
+      }
+    });
+    return nextObject;
+  }
+
+  return children.map((child) => buildNodeCallValue(child, values, exponents, tupleArrays));
+}
+
+function buildNodeCallValue(node, values, exponents, tupleArrays = {}) {
+  if (node.kind === "leaf") {
+    const rawValue = values[node.key] || "";
+
+    if (SCALE_TYPES.has(node.type)) {
+      const exponent = Number(exponents[node.key] || 0);
+      if (exponent > 0) {
+        return parseDecimalWithExponent(rawValue, exponent);
+      }
+      if (rawValue.includes(".")) {
+        throw new Error("uint 类型不支持小数，请选择 10^n 或改用整数。");
+      }
+    }
+
+    return parseInputValue(rawValue, node.type);
+  }
+
+  if (node.kind === "tupleArray") {
+    const rows = Array.isArray(tupleArrays[node.key]) ? tupleArrays[node.key] : [];
+    return rows.map((row) => {
+      const rowValues =
+        row?.values && typeof row.values === "object" && !Array.isArray(row.values)
+          ? row.values
+          : {};
+      const rowExponents =
+        row?.exponents && typeof row.exponents === "object" && !Array.isArray(row.exponents)
+          ? row.exponents
+          : {};
+      return buildChildrenCallValue(node.children, rowValues, rowExponents, {});
+    });
+  }
+
+  return buildChildrenCallValue(node.children, values, exponents, tupleArrays);
+}
+
+function cloneMethodStates(methodStates) {
+  return JSON.parse(JSON.stringify(methodStates || {}));
 }
 
 function sanitizeMethodStates(raw) {
   if (!raw || typeof raw !== "object") return {};
   const next = {};
   Object.entries(raw).forEach(([key, value]) => {
-    if (!value || typeof value !== "object") return;
-    const params = Array.isArray(value.params)
-      ? value.params.map((item) => String(item ?? ""))
-      : [];
-    const exponents = Array.isArray(value.exponents)
-      ? value.exponents
-          .map((item) => Number(item || 0))
-          .map((item) => (Number.isNaN(item) ? 0 : item))
-      : [];
-    next[key] = {
-      params,
-      exponents,
-      payableValue: String(value.payableValue ?? ""),
-    };
+    next[key] = sanitizeMethodState(value);
   });
   return next;
-}
-
-function cloneMethodStates(methodStates) {
-  return JSON.parse(JSON.stringify(methodStates || {}));
 }
 
 function normalizePanelValues(panel) {
@@ -233,11 +597,9 @@ function loadTemplatesFromStorage() {
   try {
     const raw = localStorage.getItem(TEMPLATE_STORAGE_KEY);
     if (!raw) return [];
+
     const parsed = JSON.parse(raw);
-    const list = extractTemplateList(parsed)
-      .map(sanitizeTemplate)
-      .filter(Boolean);
-    return list;
+    return extractTemplateList(parsed).map(sanitizeTemplate).filter(Boolean);
   } catch {
     return [];
   }
@@ -253,17 +615,17 @@ function MethodCard({
   methodStorageKey,
   savedCallState,
 }) {
-  const inputLength = fn.inputs?.length || 0;
-  const normalizedSavedCallState = useMemo(
-    () => normalizeMethodState(savedCallState, inputLength),
-    [savedCallState, inputLength]
+  const paramNodes = useMemo(() => buildParamNodes(fn.inputs || []), [fn]);
+
+  const normalizedSavedState = useMemo(
+    () => normalizeMethodDraftState(savedCallState, paramNodes),
+    [savedCallState, paramNodes]
   );
 
-  const [params, setParams] = useState(normalizedSavedCallState.params);
-  const [exponents, setExponents] = useState(normalizedSavedCallState.exponents);
-  const [payableValue, setPayableValue] = useState(
-    normalizedSavedCallState.payableValue
-  );
+  const [fieldValues, setFieldValues] = useState(normalizedSavedState.values);
+  const [fieldExponents, setFieldExponents] = useState(normalizedSavedState.exponents);
+  const [tupleArrayRows, setTupleArrayRows] = useState(normalizedSavedState.tupleArrays);
+  const [payableValue, setPayableValue] = useState(normalizedSavedState.payableValue);
   const [output, setOutput] = useState(
     kind === "read" ? "调用结果将在此显示" : "交易状态将在此显示"
   );
@@ -272,33 +634,246 @@ function MethodCard({
   const signature = getFunctionSignature(fn);
 
   useEffect(() => {
-    setParams(normalizedSavedCallState.params);
-    setExponents(normalizedSavedCallState.exponents);
-    setPayableValue(normalizedSavedCallState.payableValue);
-  }, [normalizedSavedCallState]);
+    setFieldValues(normalizedSavedState.values);
+    setFieldExponents(normalizedSavedState.exponents);
+    setTupleArrayRows(normalizedSavedState.tupleArrays);
+    setPayableValue(normalizedSavedState.payableValue);
+  }, [normalizedSavedState]);
 
   const persistCurrentInputs = () => {
     onPersist(methodStorageKey, {
-      params: [...params],
-      exponents: [...exponents],
+      values: { ...fieldValues },
+      exponents: { ...fieldExponents },
+      tupleArrays: JSON.parse(JSON.stringify(tupleArrayRows || {})),
       payableValue,
     });
   };
 
-  const handleParamChange = (index, value) => {
-    setParams((prev) => {
-      const next = [...prev];
-      next[index] = value;
-      return next;
+  const handleValueChange = (key, value) => {
+    setFieldValues((prev) => ({
+      ...prev,
+      [key]: value,
+    }));
+  };
+
+  const handleExponentChange = (key, value) => {
+    setFieldExponents((prev) => ({
+      ...prev,
+      [key]: value,
+    }));
+  };
+
+  const handleTupleArrayValueChange = (tupleNode, rowIndex, fieldKey, value) => {
+    setTupleArrayRows((prev) => {
+      const tupleKey = tupleNode.key;
+      const previousRows = Array.isArray(prev[tupleKey]) ? prev[tupleKey] : [];
+      const rows = previousRows.map((row) => sanitizeTupleArrayRow(row));
+
+      while (rows.length <= rowIndex) {
+        rows.push(createTupleArrayRowDraft(tupleNode));
+      }
+
+      const targetRow = rows[rowIndex] || createTupleArrayRowDraft(tupleNode);
+      targetRow.values[fieldKey] = value;
+      rows[rowIndex] = targetRow;
+
+      return {
+        ...prev,
+        [tupleKey]: rows,
+      };
     });
   };
 
-  const handleExponentChange = (index, value) => {
-    setExponents((prev) => {
-      const next = [...prev];
-      next[index] = value;
-      return next;
+  const handleTupleArrayExponentChange = (tupleNode, rowIndex, fieldKey, value) => {
+    setTupleArrayRows((prev) => {
+      const tupleKey = tupleNode.key;
+      const previousRows = Array.isArray(prev[tupleKey]) ? prev[tupleKey] : [];
+      const rows = previousRows.map((row) => sanitizeTupleArrayRow(row));
+
+      while (rows.length <= rowIndex) {
+        rows.push(createTupleArrayRowDraft(tupleNode));
+      }
+
+      const targetRow = rows[rowIndex] || createTupleArrayRowDraft(tupleNode);
+      targetRow.exponents[fieldKey] = value;
+      rows[rowIndex] = targetRow;
+
+      return {
+        ...prev,
+        [tupleKey]: rows,
+      };
     });
+  };
+
+  const handleAddTupleArrayRow = (tupleNode) => {
+    setTupleArrayRows((prev) => {
+      const tupleKey = tupleNode.key;
+      const previousRows = Array.isArray(prev[tupleKey]) ? prev[tupleKey] : [];
+      const rows = previousRows.map((row) => sanitizeTupleArrayRow(row));
+      rows.push(createTupleArrayRowDraft(tupleNode));
+      return {
+        ...prev,
+        [tupleKey]: rows,
+      };
+    });
+  };
+
+  const handleRemoveTupleArrayRow = (tupleNode, rowIndex) => {
+    setTupleArrayRows((prev) => {
+      const tupleKey = tupleNode.key;
+      const previousRows = Array.isArray(prev[tupleKey]) ? prev[tupleKey] : [];
+      if (rowIndex < 0 || rowIndex >= previousRows.length) return prev;
+
+      const rows = previousRows.map((row) => sanitizeTupleArrayRow(row));
+      rows.splice(rowIndex, 1);
+
+      return {
+        ...prev,
+        [tupleKey]: rows,
+      };
+    });
+  };
+
+  const renderNode = (node, depth = 0, rowContext = null) => {
+    const displayName = node.name || `arg${node.path[node.path.length - 1] || 0}`;
+
+    if (node.kind === "tuple") {
+      return (
+        <div className="tuple-group" key={node.key} style={{ marginLeft: depth > 0 ? 12 : 0 }}>
+          <div className="tuple-heading">
+            {displayName} ({node.type})
+          </div>
+          <div className="tuple-children">
+            {node.children.map((child) => renderNode(child, depth + 1, rowContext))}
+          </div>
+        </div>
+      );
+    }
+
+    if (node.kind === "tupleArray") {
+      const rows = Array.isArray(tupleArrayRows[node.key]) ? tupleArrayRows[node.key] : [];
+
+      return (
+        <div className="tuple-group" key={node.key} style={{ marginLeft: depth > 0 ? 12 : 0 }}>
+          <div className="tuple-array-header">
+            <div className="tuple-heading">
+              {displayName} ({node.type})
+            </div>
+            <button
+              className="btn ghost tiny-btn"
+              type="button"
+              onClick={() => handleAddTupleArrayRow(node)}
+            >
+              新增一行
+            </button>
+          </div>
+
+          {rows.length === 0 ? (
+            <div className="tuple-array-empty">当前没有数据行，可点击“新增一行”。</div>
+          ) : (
+            <div className="tuple-array-rows">
+              {rows.map((row, rowIndex) => {
+                const safeRow = sanitizeTupleArrayRow(row);
+                const nextContext = {
+                  tupleNode: node,
+                  rowIndex,
+                  values: safeRow.values,
+                  exponents: safeRow.exponents,
+                };
+
+                return (
+                  <div className="tuple-array-row" key={`${node.key}-${rowIndex}`}>
+                    <div className="tuple-array-row-header">
+                      <span>第 {rowIndex + 1} 行</span>
+                      <button
+                        className="btn ghost tiny-btn danger-btn"
+                        type="button"
+                        onClick={() => handleRemoveTupleArrayRow(node, rowIndex)}
+                      >
+                        删除
+                      </button>
+                    </div>
+                    <div className="tuple-children">
+                      {node.children.map((child) => renderNode(child, depth + 1, nextContext))}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    const scopedValues = rowContext ? rowContext.values : fieldValues;
+    const scopedExponents = rowContext ? rowContext.exponents : fieldExponents;
+    const value = scopedValues[node.key] ?? "";
+    const exponent = Number(scopedExponents[node.key] || 0);
+
+    const handleScopedValueChange = (nextValue) => {
+      if (rowContext) {
+        handleTupleArrayValueChange(rowContext.tupleNode, rowContext.rowIndex, node.key, nextValue);
+        return;
+      }
+      handleValueChange(node.key, nextValue);
+    };
+
+    const handleScopedExponentChange = (nextValue) => {
+      if (rowContext) {
+        handleTupleArrayExponentChange(
+          rowContext.tupleNode,
+          rowContext.rowIndex,
+          node.key,
+          nextValue
+        );
+        return;
+      }
+      handleExponentChange(node.key, nextValue);
+    };
+
+    return (
+      <div className="param" key={node.key} style={{ marginLeft: depth > 0 ? 12 : 0 }}>
+        <label>
+          {displayName} ({node.type})
+        </label>
+        {SCALE_TYPES.has(node.type) ? (
+          <div className="input-with-addon">
+            <input
+              type="text"
+              placeholder={
+                node.type.includes("[]") || node.type.startsWith("tuple")
+                  ? "JSON 格式"
+                  : "输入参数"
+              }
+              value={value}
+              onChange={(event) => handleScopedValueChange(event.target.value)}
+            />
+            <select
+              className="addon-select"
+              value={exponent}
+              onChange={(event) => handleScopedExponentChange(Number(event.target.value))}
+            >
+              {EXPONENT_OPTIONS.map((exp) => (
+                <option key={exp} value={exp}>
+                  10^{exp}
+                </option>
+              ))}
+            </select>
+          </div>
+        ) : (
+          <input
+            type="text"
+            placeholder={
+              node.type.includes("[]") || node.type.startsWith("tuple")
+                ? "JSON 格式"
+                : "输入参数"
+            }
+            value={value}
+            onChange={(event) => handleScopedValueChange(event.target.value)}
+          />
+        )}
+      </div>
+    );
   };
 
   const handleCall = async () => {
@@ -308,20 +883,9 @@ function MethodCard({
     setTxHash("");
 
     try {
-      const parsedArgs = (fn.inputs || []).map((input, index) => {
-        const rawValue = params[index] || "";
-        if (SCALE_TYPES.has(input.type)) {
-          const exponent = Number(exponents[index] || 0);
-          if (exponent > 0) {
-            return parseDecimalWithExponent(rawValue, exponent);
-          }
-          if (rawValue.includes(".")) {
-            throw new Error("uint 类型不支持小数，请选择 10^n 或改用整数。");
-          }
-          return parseInputValue(rawValue, input.type);
-        }
-        return parseInputValue(rawValue, input.type);
-      });
+      const parsedArgs = paramNodes.map((node) =>
+        buildNodeCallValue(node, fieldValues, fieldExponents, tupleArrayRows)
+      );
 
       if (kind === "read") {
         const result = await onRead(fn, parsedArgs);
@@ -356,59 +920,10 @@ function MethodCard({
         <div>{fn.name}</div>
         <span className="method-meta">{signature}</span>
       </summary>
+
       <div className="method-body">
-        {fn.inputs?.length > 0 && (
-          <div className="param-grid">
-            {fn.inputs.map((input, index) => (
-              <div className="param" key={`${input.name}-${index}`}>
-                <label>
-                  {input.name || `arg${index}`} ({input.type})
-                </label>
-                {SCALE_TYPES.has(input.type) ? (
-                  <div className="input-with-addon">
-                    <input
-                      type="text"
-                      placeholder={
-                        input.type.includes("[]") || input.type.startsWith("tuple")
-                          ? "JSON 格式"
-                          : "输入参数"
-                      }
-                      value={params[index]}
-                      onChange={(event) =>
-                        handleParamChange(index, event.target.value)
-                      }
-                    />
-                    <select
-                      className="addon-select"
-                      value={exponents[index]}
-                      onChange={(event) =>
-                        handleExponentChange(index, Number(event.target.value))
-                      }
-                    >
-                      {EXPONENT_OPTIONS.map((exp) => (
-                        <option key={exp} value={exp}>
-                          10^{exp}
-                        </option>
-                      ))}
-                    </select>
-                  </div>
-                ) : (
-                  <input
-                    type="text"
-                    placeholder={
-                      input.type.includes("[]") || input.type.startsWith("tuple")
-                        ? "JSON 格式"
-                        : "输入参数"
-                    }
-                    value={params[index]}
-                    onChange={(event) =>
-                      handleParamChange(index, event.target.value)
-                    }
-                  />
-                )}
-              </div>
-            ))}
-          </div>
+        {paramNodes.length > 0 && (
+          <div className="param-grid">{paramNodes.map((node) => renderNode(node))}</div>
         )}
 
         {kind === "write" && fn.stateMutability === "payable" && (
@@ -460,7 +975,6 @@ export default function App() {
   const [chainId, setChainId] = useState(DEFAULTS.chainId);
   const [contractAddress, setContractAddress] = useState(DEFAULTS.contractAddress);
   const [abiText, setAbiText] = useState(DEFAULTS.abi);
-  const [abi, setAbi] = useState(null);
   const [readFns, setReadFns] = useState([]);
   const [writeFns, setWriteFns] = useState([]);
   const [activeTab, setActiveTab] = useState("read");
@@ -474,13 +988,17 @@ export default function App() {
   const [isExportModalOpen, setIsExportModalOpen] = useState(false);
   const [exportSelection, setExportSelection] = useState({});
 
-  const { isConnected } = useAccount();
+  const { isConnected, address } = useAccount();
+  const walletChainId = useChainId();
   const { data: walletClient } = useWalletClient();
 
   const templateMenuRef = useRef(null);
   const importInputRef = useRef(null);
+  const autoSwitchRef = useRef("");
 
   const rpcOptions = useMemo(() => parseRpcList(rpcListText), [rpcListText]);
+  const parsedChainId = useMemo(() => parseChainIdValue(chainId), [chainId]);
+
   const activeTemplate = useMemo(
     () => templates.find((item) => item.id === activeTemplateId) || null,
     [templates, activeTemplateId]
@@ -520,6 +1038,75 @@ export default function App() {
     setStatus({ message, type });
   };
 
+  const ensureWalletChain = async (targetChainId) => {
+    if (!targetChainId || !window.ethereum?.request) return;
+
+    const hexChainId = `0x${targetChainId.toString(16)}`;
+
+    try {
+      await window.ethereum.request({
+        method: "wallet_switchEthereumChain",
+        params: [{ chainId: hexChainId }],
+      });
+    } catch (error) {
+      const code = error?.code ?? error?.data?.originalError?.code;
+      if (code !== 4902 || !selectedRpc) {
+        throw error;
+      }
+
+      const explorerUrl = explorerBase ? explorerBase.replace(/\/$/, "") : undefined;
+      const addParams = {
+        chainId: hexChainId,
+        chainName: `Chain ${targetChainId}`,
+        nativeCurrency: {
+          name: "Native Token",
+          symbol: "NATIVE",
+          decimals: 18,
+        },
+        rpcUrls: [selectedRpc],
+      };
+
+      if (explorerUrl) {
+        addParams.blockExplorerUrls = [explorerUrl];
+      }
+
+      await window.ethereum.request({
+        method: "wallet_addEthereumChain",
+        params: [addParams],
+      });
+
+      await window.ethereum.request({
+        method: "wallet_switchEthereumChain",
+        params: [{ chainId: hexChainId }],
+      });
+    }
+  };
+
+  useEffect(() => {
+    if (!isConnected || !address) {
+      autoSwitchRef.current = "";
+      return;
+    }
+
+    if (!parsedChainId) return;
+    if (walletChainId === parsedChainId) return;
+
+    const switchKey = `${address}:${parsedChainId}`;
+    if (autoSwitchRef.current === switchKey) return;
+
+    autoSwitchRef.current = switchKey;
+    ensureWalletChain(parsedChainId).catch(() => {
+      updateStatus("钱包切换网络失败，请在钱包中手动切换。", "error");
+    });
+  }, [
+    isConnected,
+    address,
+    parsedChainId,
+    walletChainId,
+    selectedRpc,
+    explorerBase,
+  ]);
+
   const getCurrentPanelValues = () => ({
     rpcListText,
     selectedRpc,
@@ -552,16 +1139,20 @@ export default function App() {
     });
   };
 
-  const fetchAbiFromExplorer = async (address) => {
+  const fetchAbiFromExplorer = async (addressValue) => {
     if (!explorerApi) {
       throw new Error("未填写 ABI 且未提供浏览器 API 地址。\n请粘贴 ABI 或填写 API 地址。");
     }
+
     const url = new URL(explorerApi);
     url.searchParams.set("module", "contract");
     url.searchParams.set("action", "getabi");
-    url.searchParams.set("address", address);
+    url.searchParams.set("address", addressValue);
     if (explorerApiKey) {
       url.searchParams.set("apikey", explorerApiKey);
+    }
+    if (parsedChainId) {
+      url.searchParams.set("chainid", String(parsedChainId));
     }
 
     const response = await fetch(url.toString());
@@ -573,6 +1164,7 @@ export default function App() {
     if (data.status !== "1") {
       throw new Error(data.result || "ABI 获取失败。请确认合约已验证。");
     }
+
     return data.result;
   };
 
@@ -589,6 +1181,9 @@ export default function App() {
     url.searchParams.set("tag", "latest");
     if (explorerApiKey) {
       url.searchParams.set("apikey", explorerApiKey);
+    }
+    if (parsedChainId) {
+      url.searchParams.set("chainid", String(parsedChainId));
     }
 
     const response = await fetch(url.toString());
@@ -608,6 +1203,7 @@ export default function App() {
     if (!result) {
       throw new Error("浏览器 API 代理返回未知格式。");
     }
+
     return result;
   };
 
@@ -639,12 +1235,11 @@ export default function App() {
         args,
       });
       const raw = await proxyEthCall({ to: contractAddress, data });
-      const decoded = decodeFunctionResult({
+      return decodeFunctionResult({
         abi: [fn],
         functionName: fn.name,
         data: raw,
       });
-      return decoded;
     } catch (proxyError) {
       const rpcMessage = rpcError?.message || rpcError;
       const proxyMessage = proxyError?.message || proxyError;
@@ -655,27 +1250,46 @@ export default function App() {
   };
 
   const handleWrite = async (fn, args, valueEth) => {
-    if (!walletClient || !isConnected) {
+    if (!isConnected) {
       throw new Error("请先连接钱包。");
     }
     if (!publicClient) {
       throw new Error("请先填写 RPC 端点。\n或确保 RPC 列表已选中。");
     }
 
+    if (parsedChainId && walletChainId !== parsedChainId) {
+      await ensureWalletChain(parsedChainId);
+    }
+
+    let signerClient = walletClient;
+    if (!signerClient && window.ethereum?.request) {
+      signerClient = createWalletClient({ transport: custom(window.ethereum) });
+    }
+    if (!signerClient) {
+      throw new Error("未获取到钱包签名器，请重新连接钱包。");
+    }
+
+    let account = signerClient.account;
+    if (!account) {
+      const addresses = await signerClient.requestAddresses();
+      if (!addresses || addresses.length === 0) {
+        throw new Error("未获取到钱包地址，请重新连接钱包。");
+      }
+      account = addresses[0];
+    }
+
     const value = valueEth?.trim() ? parseEther(valueEth.trim()) : undefined;
-    const hash = await walletClient.writeContract({
+
+    const hash = await signerClient.writeContract({
       address: contractAddress,
       abi: [fn],
       functionName: fn.name,
       args,
       value,
-      account: walletClient.account,
+      account,
     });
 
-    const receiptPromise = publicClient
-      ? publicClient.waitForTransactionReceipt({ hash })
-      : Promise.resolve(null);
-
+    const receiptPromise = publicClient.waitForTransactionReceipt({ hash });
     return { hash, receiptPromise };
   };
 
@@ -710,13 +1324,9 @@ export default function App() {
         throw new Error("ABI 格式无效，请确认是 JSON 数组。");
       }
 
-      setAbi(parsed);
       const functions = parsed.filter((item) => item.type === "function");
-      const reads = functions.filter((fn) => isReadFunction(fn));
-      const writes = functions.filter((fn) => !isReadFunction(fn));
-
-      setReadFns(reads);
-      setWriteFns(writes);
+      setReadFns(functions.filter((fn) => isReadFunction(fn)));
+      setWriteFns(functions.filter((fn) => !isReadFunction(fn)));
       updateStatus("合约已加载完成。", "success");
     } catch (error) {
       updateStatus(`加载失败：${error?.message || error}`, "error");
@@ -724,17 +1334,7 @@ export default function App() {
   };
 
   const handlePersistMethodState = (methodKey, nextState) => {
-    const safeState = {
-      params: Array.isArray(nextState?.params)
-        ? nextState.params.map((item) => String(item ?? ""))
-        : [],
-      exponents: Array.isArray(nextState?.exponents)
-        ? nextState.exponents
-            .map((item) => Number(item || 0))
-            .map((item) => (Number.isNaN(item) ? 0 : item))
-        : [],
-      payableValue: String(nextState?.payableValue ?? ""),
-    };
+    const safeState = sanitizeMethodState(nextState);
 
     setMethodDrafts((prev) => ({
       ...prev,
@@ -791,7 +1391,7 @@ export default function App() {
   };
 
   const handleSaveOrUpdateTemplate = () => {
-    const currentPanel = getCurrentPanelValues();
+    const panel = getCurrentPanelValues();
     const now = getCurrentIsoTime();
 
     if (activeTemplate) {
@@ -802,7 +1402,7 @@ export default function App() {
           return {
             ...item,
             name: nextName,
-            panel: currentPanel,
+            panel,
             methodStates: cloneMethodStates(methodDrafts),
             updatedAt: now,
           };
@@ -814,8 +1414,8 @@ export default function App() {
     }
 
     const nameFromInput = templateNameInput.trim();
-    const name = nameFromInput || window.prompt("请输入模板名称") || "";
-    const finalName = name.trim();
+    const promptName = window.prompt("请输入模板名称") || "";
+    const finalName = (nameFromInput || promptName).trim();
     if (!finalName) {
       updateStatus("模板名称不能为空。", "error");
       return;
@@ -824,7 +1424,7 @@ export default function App() {
     const nextTemplate = {
       id: generateTemplateId(),
       name: finalName,
-      panel: currentPanel,
+      panel,
       methodStates: cloneMethodStates(methodDrafts),
       createdAt: now,
       updatedAt: now,
@@ -850,8 +1450,7 @@ export default function App() {
         const text = await file.text();
         const parsed = JSON.parse(text);
         const list = extractTemplateList(parsed);
-        const sanitized = list.map(sanitizeTemplate).filter(Boolean);
-        importedTemplates.push(...sanitized);
+        importedTemplates.push(...list.map(sanitizeTemplate).filter(Boolean));
       } catch {
         invalidFiles += 1;
       }
@@ -878,9 +1477,7 @@ export default function App() {
       return nextTemplates;
     });
 
-    const invalidMessage = invalidFiles
-      ? `，${invalidFiles} 个文件解析失败`
-      : "";
+    const invalidMessage = invalidFiles ? `，${invalidFiles} 个文件解析失败` : "";
     updateStatus(`成功导入 ${importedTemplates.length} 个模板${invalidMessage}。`, "success");
   };
 
@@ -907,8 +1504,8 @@ export default function App() {
   };
 
   const handleToggleExportAll = () => {
-    const allChecked = templates.length > 0 &&
-      templates.every((template) => exportSelection[template.id]);
+    const allChecked =
+      templates.length > 0 && templates.every((template) => exportSelection[template.id]);
 
     const nextSelection = {};
     templates.forEach((template) => {
@@ -918,9 +1515,7 @@ export default function App() {
   };
 
   const handleConfirmExport = () => {
-    const selectedTemplates = templates.filter(
-      (template) => exportSelection[template.id]
-    );
+    const selectedTemplates = templates.filter((template) => exportSelection[template.id]);
 
     if (!selectedTemplates.length) {
       updateStatus("请至少选择一个模板进行导出。", "error");
@@ -938,9 +1533,8 @@ export default function App() {
     });
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
-    const filename = `contract-templates-${Date.now()}.json`;
     link.href = url;
-    link.download = filename;
+    link.download = `contract-templates-${Date.now()}.json`;
     document.body.appendChild(link);
     link.click();
     link.remove();
@@ -959,7 +1553,6 @@ export default function App() {
     setChainId("");
     setContractAddress("");
     setAbiText("");
-    setAbi(null);
     setReadFns([]);
     setWriteFns([]);
     setMethodDrafts({});
@@ -968,14 +1561,13 @@ export default function App() {
 
   const activeList = activeTab === "read" ? readFns : writeFns;
   const emptyText =
-    activeTab === "read"
-      ? "请先加载合约。"
-      : "加载合约后，这里会展示可写方法。";
+    activeTab === "read" ? "请先加载合约。" : "加载合约后，这里会展示可写方法。";
 
   return (
     <div>
       <div className="bg-orb bg-orb-1"></div>
       <div className="bg-orb bg-orb-2"></div>
+
       <header className="hero">
         <div>
           <p className="eyebrow">Common EVM Contract Dashboard</p>
@@ -1069,13 +1661,10 @@ export default function App() {
             >
               导入
             </button>
-            <button
-              className="btn ghost small-btn"
-              type="button"
-              onClick={openExportModal}
-            >
+            <button className="btn ghost small-btn" type="button" onClick={openExportModal}>
               导出
             </button>
+
             <input
               ref={importInputRef}
               type="file"
@@ -1108,10 +1697,7 @@ export default function App() {
 
           <label className="field">
             <span>当前使用的 RPC</span>
-            <select
-              value={selectedRpc}
-              onChange={(event) => setSelectedRpc(event.target.value)}
-            >
+            <select value={selectedRpc} onChange={(event) => setSelectedRpc(event.target.value)}>
               {rpcOptions.length === 0 && <option value="">请先填写 RPC</option>}
               {rpcOptions.map((rpc, index) => (
                 <option value={rpc} key={rpc}>
@@ -1132,7 +1718,7 @@ export default function App() {
               />
             </label>
             <label className="field">
-              <span>链 ID（用于展示/切链提示）</span>
+              <span>链 ID（用于钱包默认连接网络）</span>
               <input
                 type="text"
                 value={chainId}

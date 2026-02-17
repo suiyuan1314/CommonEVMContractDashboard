@@ -9,6 +9,7 @@ import {
 } from "@rainbow-me/rainbowkit/wallets";
 import { WagmiProvider, createConfig, http } from "wagmi";
 import { defineChain } from "viem";
+import * as viemChains from "viem/chains";
 import "@rainbow-me/rainbowkit/styles.css";
 import "./styles.css";
 import App from "./App.jsx";
@@ -40,7 +41,23 @@ const wardenChain = defineChain({
   },
 });
 
-const chains = [wardenChain];
+const dynamicChains = Object.values(viemChains).filter(
+  (chain) =>
+    chain &&
+    typeof chain.id === "number" &&
+    chain.rpcUrls &&
+    chain.rpcUrls.default &&
+    Array.isArray(chain.rpcUrls.default.http) &&
+    chain.rpcUrls.default.http.length > 0
+);
+
+const chainMap = new Map();
+[wardenChain, ...dynamicChains].forEach((chain) => {
+  if (!chainMap.has(chain.id)) {
+    chainMap.set(chain.id, chain);
+  }
+});
+const chains = Array.from(chainMap.values());
 
 const connectors = connectorsForWallets(
   [
@@ -58,9 +75,9 @@ const connectors = connectorsForWallets(
 const config = createConfig({
   chains,
   connectors,
-  transports: {
-    [wardenChain.id]: http(wardenChain.rpcUrls.default.http[0]),
-  },
+  transports: Object.fromEntries(
+    chains.map((chain) => [chain.id, http(chain.rpcUrls.default.http[0])])
+  ),
 });
 
 const queryClient = new QueryClient();

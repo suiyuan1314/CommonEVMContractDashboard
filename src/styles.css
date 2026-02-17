@@ -325,6 +325,17 @@ select:focus {
   transform: translateY(1px);
 }
 
+.tiny-btn {
+  width: auto;
+  padding: 6px 10px;
+  min-width: 0;
+  font-size: 0.78rem;
+}
+
+.danger-btn {
+  color: var(--danger);
+}
+
 .small-btn {
   width: auto;
   min-width: 78px;
@@ -456,6 +467,65 @@ select:focus {
   display: flex;
   flex-direction: column;
   gap: 6px;
+}
+
+.tuple-group {
+  border: 1px dashed rgba(255, 255, 255, 0.14);
+  border-radius: 10px;
+  padding: 10px;
+  background: rgba(7, 12, 24, 0.45);
+}
+
+.tuple-heading {
+  font-size: 0.86rem;
+  color: var(--accent-strong);
+  margin-bottom: 8px;
+}
+
+.tuple-array-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+.tuple-array-header .tuple-heading {
+  margin-bottom: 0;
+}
+
+.tuple-array-empty {
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+
+.tuple-array-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.tuple-array-row {
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 10px;
+  padding: 10px;
+  background: rgba(5, 9, 20, 0.5);
+}
+
+.tuple-array-row-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+.tuple-children {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
 }
 
 .param label {
@@ -620,6 +690,16 @@ select:focus {
   .small-btn {
     width: calc(50% - 5px);
     min-width: 0;
+  }
+
+  .tuple-array-header {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .tuple-array-row-header .tiny-btn,
+  .tuple-array-header .tiny-btn {
+    width: auto;
   }
 
   .template-picker {
