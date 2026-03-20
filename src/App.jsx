@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { ConnectButton } from "@rainbow-me/rainbowkit";
 import { useAccount, useChainId, useWalletClient } from "wagmi";
+import QRCode from "qrcode";
 import {
   createPublicClient,
   createWalletClient,
@@ -26,6 +27,89 @@ const TEMPLATE_STORAGE_KEY = "common-evm-dashboard.templates.v1";
 const TEMPLATE_EXPORT_VERSION = 1;
 const EXPONENT_OPTIONS = [0, 6, 9, 12, 18, 24];
 const SCALE_TYPES = new Set(["uint256", "uint128"]);
+const QR_EXPORT_MAX_LENGTH = 2000;
+const KNOWN_PROXY_ABI_BY_NAME = {
+  TransparentUpgradeableProxy: [
+    {
+      type: "function",
+      name: "admin",
+      stateMutability: "nonpayable",
+      inputs: [],
+      outputs: [{ name: "", type: "address" }],
+    },
+    {
+      type: "function",
+      name: "implementation",
+      stateMutability: "nonpayable",
+      inputs: [],
+      outputs: [{ name: "", type: "address" }],
+    },
+    {
+      type: "function",
+      name: "changeAdmin",
+      stateMutability: "nonpayable",
+      inputs: [{ name: "newAdmin", type: "address" }],
+      outputs: [],
+    },
+    {
+      type: "function",
+      name: "upgradeTo",
+      stateMutability: "nonpayable",
+      inputs: [{ name: "newImplementation", type: "address" }],
+      outputs: [],
+    },
+    {
+      type: "function",
+      name: "upgradeToAndCall",
+      stateMutability: "payable",
+      inputs: [
+        { name: "newImplementation", type: "address" },
+        { name: "data", type: "bytes" },
+      ],
+      outputs: [],
+    },
+  ],
+  OptimizedTransparentUpgradeableProxy: [
+    {
+      type: "function",
+      name: "admin",
+      stateMutability: "nonpayable",
+      inputs: [],
+      outputs: [{ name: "", type: "address" }],
+    },
+    {
+      type: "function",
+      name: "implementation",
+      stateMutability: "nonpayable",
+      inputs: [],
+      outputs: [{ name: "", type: "address" }],
+    },
+    {
+      type: "function",
+      name: "changeAdmin",
+      stateMutability: "nonpayable",
+      inputs: [{ name: "newAdmin", type: "address" }],
+      outputs: [],
+    },
+    {
+      type: "function",
+      name: "upgradeTo",
+      stateMutability: "nonpayable",
+      inputs: [{ name: "newImplementation", type: "address" }],
+      outputs: [],
+    },
+    {
+      type: "function",
+      name: "upgradeToAndCall",
+      stateMutability: "payable",
+      inputs: [
+        { name: "newImplementation", type: "address" },
+        { name: "data", type: "bytes" },
+      ],
+      outputs: [],
+    },
+  ],
+};
 
 function shortAddress(address) {
   if (!address) return "";
@@ -148,6 +232,11 @@ function getCurrentIsoTime() {
 
 function buildMethodStorageKey(kind, fn) {
   return `${kind}:${getFunctionSignature(fn)}`;
+}
+
+function buildScopedMethodStorageKey(scope, kind, fn) {
+  const baseKey = buildMethodStorageKey(kind, fn);
+  return scope === "contract" ? baseKey : `${scope}:${baseKey}`;
 }
 
 function isExpandableTuple(param) {
@@ -327,6 +416,89 @@ function parseJsonIfPossible(value) {
   } catch {
     return undefined;
   }
+}
+
+function buildExplorerAddressUrl(explorerBase, address) {
+  if (!explorerBase || !address) return "";
+  return `${explorerBase.replace(/\/$/, "")}/address/${address}`;
+}
+
+function parseExplorerProxyFlag(value) {
+  const normalized = String(value ?? "")
+    .trim()
+    .toLowerCase();
+  return normalized === "1" || normalized === "true" || normalized === "yes";
+}
+
+function getImplementationAddressFromMetadata(metadata) {
+  const candidates = [metadata?.Implementation, metadata?.ImplementationAddress];
+  for (const value of candidates) {
+    const candidate = String(value || "").trim();
+    if (candidate && isAddress(candidate)) {
+      return candidate;
+    }
+  }
+  return "";
+}
+
+function parseAbiTextToFunctions(rawAbiText) {
+  const parsed = JSON.parse(rawAbiText);
+  if (!Array.isArray(parsed)) {
+    throw new Error("ABI 格式无效，请确认是 JSON 数组。");
+  }
+
+  return parsed.filter((item) => item.type === "function");
+}
+
+function buildTemplateExportPayload(selectedTemplates) {
+  return {
+    version: TEMPLATE_EXPORT_VERSION,
+    exportedAt: getCurrentIsoTime(),
+    templates: selectedTemplates,
+  };
+}
+
+function normalizeAbiText(rawAbiText) {
+  if (!rawAbiText) return "";
+  return JSON.stringify(JSON.parse(rawAbiText));
+}
+
+function getKnownProxyFunctions(contractName) {
+  const normalizedName = String(contractName || "").trim();
+  if (!normalizedName) return null;
+
+  if (KNOWN_PROXY_ABI_BY_NAME[normalizedName]) {
+    return KNOWN_PROXY_ABI_BY_NAME[normalizedName];
+  }
+
+  const lowerName = normalizedName.toLowerCase();
+  if (
+    lowerName.includes("transparentupgradeableproxy") ||
+    lowerName.includes("adminupgradeabilityproxy") ||
+    lowerName.includes("transparentproxy")
+  ) {
+    return KNOWN_PROXY_ABI_BY_NAME.TransparentUpgradeableProxy;
+  }
+
+  if (
+    lowerName.includes("erc1967proxy") ||
+    lowerName.includes("beaconproxy") ||
+    lowerName.includes("uupsproxy") ||
+    lowerName === "proxy"
+  ) {
+    return [];
+  }
+
+  return null;
+}
+
+function buildReusablePanelValues(panel) {
+  const normalized = normalizePanelValues(panel);
+  return {
+    ...normalized,
+    contractAddress: "",
+    abiText: "",
+  };
 }
 
 function createTupleArrayRowDraft(node, tupleValue) {
@@ -977,7 +1149,11 @@ export default function App() {
   const [abiText, setAbiText] = useState(DEFAULTS.abi);
   const [readFns, setReadFns] = useState([]);
   const [writeFns, setWriteFns] = useState([]);
+  const [proxyReadFns, setProxyReadFns] = useState([]);
+  const [proxyWriteFns, setProxyWriteFns] = useState([]);
+  const [proxyInfo, setProxyInfo] = useState(null);
   const [activeTab, setActiveTab] = useState("read");
+  const [activeScope, setActiveScope] = useState("contract");
   const [status, setStatus] = useState({ message: "", type: "" });
 
   const [templates, setTemplates] = useState([]);
@@ -985,15 +1161,22 @@ export default function App() {
   const [templateNameInput, setTemplateNameInput] = useState("");
   const [methodDrafts, setMethodDrafts] = useState({});
   const [isTemplateMenuOpen, setIsTemplateMenuOpen] = useState(false);
+  const [isImportModalOpen, setIsImportModalOpen] = useState(false);
+  const [importMode, setImportMode] = useState("file");
+  const [importJsonText, setImportJsonText] = useState("");
+  const [importUrl, setImportUrl] = useState("");
+  const [importBusy, setImportBusy] = useState(false);
   const [isExportModalOpen, setIsExportModalOpen] = useState(false);
   const [exportSelection, setExportSelection] = useState({});
+  const [exportPreviewText, setExportPreviewText] = useState("");
+  const [exportQrDataUrl, setExportQrDataUrl] = useState("");
+  const [exportQrError, setExportQrError] = useState("");
 
   const { isConnected, address } = useAccount();
   const walletChainId = useChainId();
   const { data: walletClient } = useWalletClient();
 
   const templateMenuRef = useRef(null);
-  const importInputRef = useRef(null);
   const autoSwitchRef = useRef("");
 
   const rpcOptions = useMemo(() => parseRpcList(rpcListText), [rpcListText]);
@@ -1029,6 +1212,60 @@ export default function App() {
     };
   }, [isTemplateMenuOpen]);
 
+  useEffect(() => {
+    if (!isExportModalOpen) {
+      setExportPreviewText("");
+      setExportQrDataUrl("");
+      setExportQrError("");
+      return;
+    }
+
+    const selectedTemplates = templates.filter((template) => exportSelection[template.id]);
+    const nextPreview = selectedTemplates.length
+      ? JSON.stringify(buildTemplateExportPayload(selectedTemplates), null, 2)
+      : "";
+    setExportPreviewText(nextPreview);
+  }, [exportSelection, isExportModalOpen, templates]);
+
+  useEffect(() => {
+    if (!isExportModalOpen || !exportPreviewText) {
+      setExportQrDataUrl("");
+      setExportQrError("");
+      return undefined;
+    }
+
+    if (exportPreviewText.length > QR_EXPORT_MAX_LENGTH) {
+      setExportQrDataUrl("");
+      setExportQrError(`JSON 文本较长（${exportPreviewText.length} 字符），无法生成单个二维码。`);
+      return undefined;
+    }
+
+    let cancelled = false;
+    QRCode.toDataURL(exportPreviewText, {
+      errorCorrectionLevel: "M",
+      margin: 1,
+      width: 240,
+      color: {
+        dark: "#f7f3ec",
+        light: "#121a2b",
+      },
+    })
+      .then((url) => {
+        if (cancelled) return;
+        setExportQrDataUrl(url);
+        setExportQrError("");
+      })
+      .catch((error) => {
+        if (cancelled) return;
+        setExportQrDataUrl("");
+        setExportQrError(`二维码生成失败：${error?.message || error}`);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [exportPreviewText, isExportModalOpen]);
+
   const publicClient = useMemo(() => {
     if (!selectedRpc) return null;
     return createPublicClient({ transport: http(selectedRpc) });
@@ -1036,6 +1273,19 @@ export default function App() {
 
   const updateStatus = (message, type = "") => {
     setStatus({ message, type });
+  };
+
+  const clearLoadedContractState = (options = {}) => {
+    const { clearDrafts = false } = options;
+    setReadFns([]);
+    setWriteFns([]);
+    setProxyReadFns([]);
+    setProxyWriteFns([]);
+    setProxyInfo(null);
+    setActiveScope("contract");
+    if (clearDrafts) {
+      setMethodDrafts({});
+    }
   };
 
   const ensureWalletChain = async (targetChainId) => {
@@ -1139,14 +1389,14 @@ export default function App() {
     });
   };
 
-  const fetchAbiFromExplorer = async (addressValue) => {
+  const fetchContractMetadata = async (addressValue) => {
     if (!explorerApi) {
-      throw new Error("未填写 ABI 且未提供浏览器 API 地址。\n请粘贴 ABI 或填写 API 地址。");
+      throw new Error("未提供浏览器 API 地址，无法读取合约元信息。");
     }
 
     const url = new URL(explorerApi);
     url.searchParams.set("module", "contract");
-    url.searchParams.set("action", "getabi");
+    url.searchParams.set("action", "getsourcecode");
     url.searchParams.set("address", addressValue);
     if (explorerApiKey) {
       url.searchParams.set("apikey", explorerApiKey);
@@ -1162,10 +1412,109 @@ export default function App() {
 
     const data = await response.json();
     if (data.status !== "1") {
+      throw new Error(data.result || "合约元信息获取失败。请确认合约已验证。");
+    }
+
+    const [result] = Array.isArray(data.result) ? data.result : [];
+    if (!result || typeof result !== "object") {
+      throw new Error("浏览器 API 未返回有效合约元信息。");
+    }
+
+    return result;
+  };
+
+  const fetchContractAbi = async (addressValue) => {
+    if (!explorerApi) {
+      throw new Error("未提供浏览器 API 地址，无法读取 ABI。");
+    }
+
+    const url = new URL(explorerApi);
+    url.searchParams.set("module", "contract");
+    url.searchParams.set("action", "getabi");
+    url.searchParams.set("address", addressValue);
+    if (explorerApiKey) {
+      url.searchParams.set("apikey", explorerApiKey);
+    }
+    if (parsedChainId) {
+      url.searchParams.set("chainid", String(parsedChainId));
+    }
+
+    const response = await fetch(url.toString());
+    if (!response.ok) {
+      throw new Error("浏览器 API ABI 请求失败。");
+    }
+
+    const data = await response.json();
+    if (data.status !== "1") {
       throw new Error(data.result || "ABI 获取失败。请确认合约已验证。");
     }
 
-    return data.result;
+    const abi = String(data.result || "").trim();
+    if (!abi || abi === "Contract source code not verified") {
+      throw new Error("未获取到有效 ABI。");
+    }
+
+    return abi;
+  };
+
+  const extractAbiFromMetadata = (metadata) => {
+    const abi = String(metadata?.ABI || "").trim();
+    if (!abi || abi === "Contract source code not verified") {
+      return "";
+    }
+    return abi;
+  };
+
+  const parseImportedTemplatesFromText = (text) => {
+    const parsed = JSON.parse(text);
+    const templatesFromPayload = extractTemplateList(parsed)
+      .map(sanitizeTemplate)
+      .filter(Boolean);
+
+    if (!templatesFromPayload.length) {
+      throw new Error("未读取到有效模板。");
+    }
+
+    return templatesFromPayload;
+  };
+
+  const mergeImportedTemplates = (importedTemplates) => {
+    if (!importedTemplates.length) {
+      updateStatus("导入失败：未读取到有效模板。", "error");
+      return 0;
+    }
+
+    persistTemplates((prevTemplates) => {
+      const usedIds = new Set(prevTemplates.map((item) => item.id));
+      const nextTemplates = [...prevTemplates];
+
+      importedTemplates.forEach((template) => {
+        let nextId = template.id;
+        while (usedIds.has(nextId)) {
+          nextId = generateTemplateId();
+        }
+        usedIds.add(nextId);
+        nextTemplates.push({ ...template, id: nextId, updatedAt: getCurrentIsoTime() });
+      });
+
+      return nextTemplates;
+    });
+
+    return importedTemplates.length;
+  };
+
+  const downloadTextFile = (content, filename) => {
+    const blob = new Blob([content], {
+      type: "application/json",
+    });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
   };
 
   const proxyEthCall = async ({ to, data }) => {
@@ -1312,23 +1661,108 @@ export default function App() {
     }
 
     try {
-      let resolvedAbi = abiText.trim();
+      let statusMessage = "";
+      let contractMetadata = null;
+      let metadataWarning = "";
+      const manualAbi = abiText.trim();
+
+      if (explorerApi) {
+        try {
+          contractMetadata = await fetchContractMetadata(contractAddress);
+        } catch (error) {
+          if (!manualAbi) {
+            throw error;
+          }
+          metadataWarning = `已使用手填 ABI 加载，代理检测失败：${error?.message || error}`;
+        }
+      } else if (!manualAbi) {
+        throw new Error("未填写 ABI 且未提供浏览器 API 地址。\n请粘贴 ABI 或填写 API 地址。");
+      }
+
+      let resolvedAbi = manualAbi;
+      if (!resolvedAbi && explorerApi) {
+        try {
+          resolvedAbi = await fetchContractAbi(contractAddress);
+        } catch {
+          resolvedAbi = extractAbiFromMetadata(contractMetadata);
+        }
+      }
+
       if (!resolvedAbi) {
-        updateStatus("正在通过浏览器 API 拉取 ABI...", "");
-        resolvedAbi = await fetchAbiFromExplorer(contractAddress);
+        throw new Error("未获取到 ABI。请粘贴 ABI，或确认合约已在浏览器中完成验证。");
+      }
+
+      if (!manualAbi) {
         setAbiText(resolvedAbi);
       }
 
-      const parsed = JSON.parse(resolvedAbi);
-      if (!Array.isArray(parsed)) {
-        throw new Error("ABI 格式无效，请确认是 JSON 数组。");
-      }
-
-      const functions = parsed.filter((item) => item.type === "function");
+      clearLoadedContractState();
+      const functions = parseAbiTextToFunctions(resolvedAbi);
       setReadFns(functions.filter((fn) => isReadFunction(fn)));
       setWriteFns(functions.filter((fn) => !isReadFunction(fn)));
-      updateStatus("合约已加载完成。", "success");
+
+      const isProxyContract = parseExplorerProxyFlag(contractMetadata?.Proxy);
+      const implementationAddress = getImplementationAddressFromMetadata(contractMetadata);
+
+      if (isProxyContract && implementationAddress) {
+        try {
+          const implementationMetadata = await fetchContractMetadata(implementationAddress);
+          let implementationAbiText = "";
+          try {
+            implementationAbiText = await fetchContractAbi(implementationAddress);
+          } catch {
+            implementationAbiText = extractAbiFromMetadata(implementationMetadata);
+          }
+
+          if (!implementationAbiText) {
+            throw new Error("未能获取实现合约 ABI。");
+          }
+
+          let proxyFunctions = functions;
+          const currentAbiNormalized = normalizeAbiText(resolvedAbi);
+          const implementationAbiNormalized = normalizeAbiText(implementationAbiText);
+          let abiNotice = "";
+
+          if (currentAbiNormalized === implementationAbiNormalized) {
+            const knownProxyFunctions = getKnownProxyFunctions(contractMetadata?.ContractName);
+            if (knownProxyFunctions) {
+              proxyFunctions = knownProxyFunctions;
+              abiNotice =
+                " 浏览器 API 返回的代理 ABI 与实现 ABI 相同，已回退为标准代理 ABI。";
+            } else {
+              abiNotice =
+                " 浏览器 API 返回的代理 ABI 与实现 ABI 相同，当前合约方法可能仍然是实现 ABI。";
+            }
+          }
+
+          setReadFns(proxyFunctions.filter((fn) => isReadFunction(fn)));
+          setWriteFns(proxyFunctions.filter((fn) => !isReadFunction(fn)));
+
+          const implementationFunctions = parseAbiTextToFunctions(implementationAbiText);
+          setProxyReadFns(implementationFunctions.filter((fn) => isReadFunction(fn)));
+          setProxyWriteFns(implementationFunctions.filter((fn) => !isReadFunction(fn)));
+          setProxyInfo({
+            implementationAddress,
+            implementationName: String(implementationMetadata?.ContractName || "Implementation"),
+            proxyName: String(contractMetadata?.ContractName || "Proxy"),
+          });
+          setActiveScope("proxy");
+          statusMessage = `合约已加载完成，检测到代理实现：${implementationAddress}.${abiNotice}`;
+        } catch (error) {
+          statusMessage = `合约已加载完成，但代理实现加载失败：${error?.message || error}`;
+        }
+      } else {
+        statusMessage = "合约已加载完成。";
+      }
+
+      if (metadataWarning) {
+        updateStatus(`${statusMessage} ${metadataWarning}`, "success");
+        return;
+      }
+
+      updateStatus(statusMessage, "success");
     } catch (error) {
+      clearLoadedContractState();
       updateStatus(`加载失败：${error?.message || error}`, "error");
     }
   };
@@ -1436,49 +1870,122 @@ export default function App() {
     updateStatus(`模板已保存：${finalName}`, "success");
   };
 
-  const handleImportTemplates = async (event) => {
+  const handleCreateReusableTemplate = () => {
+    if (!activeTemplateId) {
+      updateStatus("请先选择一个已有模板，再执行复用新建。", "error");
+      return;
+    }
+
+    const defaultName = `${activeTemplate?.name || "模板"}-new`;
+    const promptedName = window.prompt("请输入新模板名称", defaultName) || "";
+    const finalName = promptedName.trim();
+    if (!finalName) {
+      updateStatus("模板名称不能为空。", "error");
+      return;
+    }
+
+    const now = getCurrentIsoTime();
+    const nextTemplate = {
+      id: generateTemplateId(),
+      name: finalName,
+      panel: buildReusablePanelValues(getCurrentPanelValues()),
+      methodStates: {},
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    persistTemplates((prevTemplates) => [...prevTemplates, nextTemplate]);
+    applyPanelValues(nextTemplate.panel);
+    clearLoadedContractState({ clearDrafts: true });
+    setActiveTemplateId(nextTemplate.id);
+    setTemplateNameInput(finalName);
+    updateStatus(
+      `已基于当前模板创建新模板：${finalName}。已保留网络配置，并清空合约地址、ABI 和方法参数。`,
+      "success"
+    );
+  };
+
+  const handleImportFiles = async (event) => {
     const files = Array.from(event.target.files || []);
     event.target.value = "";
 
     if (!files.length) return;
 
-    const importedTemplates = [];
-    let invalidFiles = 0;
+    setImportBusy(true);
+    try {
+      const importedTemplates = [];
+      let invalidFiles = 0;
 
-    for (const file of files) {
-      try {
-        const text = await file.text();
-        const parsed = JSON.parse(text);
-        const list = extractTemplateList(parsed);
-        importedTemplates.push(...list.map(sanitizeTemplate).filter(Boolean));
-      } catch {
-        invalidFiles += 1;
+      for (const file of files) {
+        try {
+          const text = await file.text();
+          importedTemplates.push(...parseImportedTemplatesFromText(text));
+        } catch {
+          invalidFiles += 1;
+        }
       }
-    }
 
-    if (!importedTemplates.length) {
-      updateStatus("导入失败：未读取到有效模板。", "error");
+      const successCount = mergeImportedTemplates(importedTemplates);
+      if (!successCount) return;
+
+      const invalidMessage = invalidFiles ? `，${invalidFiles} 个文件解析失败` : "";
+      updateStatus(`成功导入 ${successCount} 个模板${invalidMessage}。`, "success");
+      setIsImportModalOpen(false);
+    } catch (error) {
+      updateStatus(`导入失败：${error?.message || error}`, "error");
+    } finally {
+      setImportBusy(false);
+    }
+  };
+
+  const handleImportJsonText = () => {
+    try {
+      const importedTemplates = parseImportedTemplatesFromText(importJsonText.trim());
+      const successCount = mergeImportedTemplates(importedTemplates);
+      if (!successCount) return;
+
+      setImportJsonText("");
+      setIsImportModalOpen(false);
+      updateStatus(`成功导入 ${successCount} 个模板。`, "success");
+    } catch (error) {
+      updateStatus(`导入失败：${error?.message || error}`, "error");
+    }
+  };
+
+  const handleImportFromUrl = async () => {
+    const url = importUrl.trim();
+    if (!url) {
+      updateStatus("请输入可访问的 JSON URL。", "error");
       return;
     }
 
-    persistTemplates((prevTemplates) => {
-      const usedIds = new Set(prevTemplates.map((item) => item.id));
-      const nextTemplates = [...prevTemplates];
+    setImportBusy(true);
+    try {
+      const response = await fetch(url);
+      if (!response.ok) {
+        throw new Error("URL 请求失败。请检查地址和跨域设置。");
+      }
 
-      importedTemplates.forEach((template) => {
-        let nextId = template.id;
-        while (usedIds.has(nextId)) {
-          nextId = generateTemplateId();
-        }
-        usedIds.add(nextId);
-        nextTemplates.push({ ...template, id: nextId, updatedAt: getCurrentIsoTime() });
-      });
+      const text = await response.text();
+      const importedTemplates = parseImportedTemplatesFromText(text);
+      const successCount = mergeImportedTemplates(importedTemplates);
+      if (!successCount) return;
 
-      return nextTemplates;
-    });
+      setImportUrl("");
+      setIsImportModalOpen(false);
+      updateStatus(`成功导入 ${successCount} 个模板。`, "success");
+    } catch (error) {
+      updateStatus(`导入失败：${error?.message || error}`, "error");
+    } finally {
+      setImportBusy(false);
+    }
+  };
 
-    const invalidMessage = invalidFiles ? `，${invalidFiles} 个文件解析失败` : "";
-    updateStatus(`成功导入 ${importedTemplates.length} 个模板${invalidMessage}。`, "success");
+  const openImportModal = () => {
+    setImportMode("file");
+    setImportJsonText("");
+    setImportUrl("");
+    setIsImportModalOpen(true);
   };
 
   const openExportModal = () => {
@@ -1522,26 +2029,36 @@ export default function App() {
       return;
     }
 
-    const payload = {
-      version: TEMPLATE_EXPORT_VERSION,
-      exportedAt: getCurrentIsoTime(),
-      templates: selectedTemplates,
-    };
-
-    const blob = new Blob([JSON.stringify(payload, null, 2)], {
-      type: "application/json",
-    });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = `contract-templates-${Date.now()}.json`;
-    document.body.appendChild(link);
-    link.click();
-    link.remove();
-    URL.revokeObjectURL(url);
-
-    setIsExportModalOpen(false);
+    const payload = buildTemplateExportPayload(selectedTemplates);
+    downloadTextFile(
+      JSON.stringify(payload, null, 2),
+      `contract-templates-${Date.now()}.json`
+    );
     updateStatus(`已导出 ${selectedTemplates.length} 个模板。`, "success");
+  };
+
+  const handleCopyExportText = async () => {
+    if (!exportPreviewText) {
+      updateStatus("请先选择要导出的模板。", "error");
+      return;
+    }
+
+    try {
+      await navigator.clipboard.writeText(exportPreviewText);
+      updateStatus("导出 JSON 已复制到剪贴板。", "success");
+    } catch (error) {
+      updateStatus(`复制失败：${error?.message || error}`, "error");
+    }
+  };
+
+  const handleDownloadExportText = () => {
+    if (!exportPreviewText) {
+      updateStatus("请先选择要导出的模板。", "error");
+      return;
+    }
+
+    downloadTextFile(exportPreviewText, `contract-templates-${Date.now()}.json`);
+    updateStatus("导出 JSON 已下载。", "success");
   };
 
   const resetAll = () => {
@@ -1553,15 +2070,28 @@ export default function App() {
     setChainId("");
     setContractAddress("");
     setAbiText("");
-    setReadFns([]);
-    setWriteFns([]);
+    clearLoadedContractState({ clearDrafts: true });
     setMethodDrafts({});
     updateStatus("已清空。", "");
   };
 
-  const activeList = activeTab === "read" ? readFns : writeFns;
+  const hasProxyView = proxyReadFns.length > 0 || proxyWriteFns.length > 0;
+  const activeList =
+    activeScope === "proxy"
+      ? activeTab === "read"
+        ? proxyReadFns
+        : proxyWriteFns
+      : activeTab === "read"
+        ? readFns
+        : writeFns;
   const emptyText =
-    activeTab === "read" ? "请先加载合约。" : "加载合约后，这里会展示可写方法。";
+    activeScope === "proxy"
+      ? activeTab === "read"
+        ? "未读取到代理实现的只读方法。"
+        : "未读取到代理实现的可写方法。"
+      : activeTab === "read"
+        ? "请先加载合约。"
+        : "加载合约后，这里会展示可写方法。";
 
   return (
     <div>
@@ -1657,22 +2187,13 @@ export default function App() {
             <button
               className="btn ghost small-btn"
               type="button"
-              onClick={() => importInputRef.current?.click()}
+              onClick={openImportModal}
             >
               导入
             </button>
             <button className="btn ghost small-btn" type="button" onClick={openExportModal}>
               导出
             </button>
-
-            <input
-              ref={importInputRef}
-              type="file"
-              accept="application/json,.json"
-              multiple
-              onChange={handleImportTemplates}
-              style={{ display: "none" }}
-            />
           </div>
 
           <label className="field">
@@ -1776,6 +2297,14 @@ export default function App() {
             <button className="btn secondary" onClick={handleSaveOrUpdateTemplate}>
               {activeTemplate ? "更新模板" : "保存模板"}
             </button>
+            <button
+              className="btn secondary"
+              onClick={handleCreateReusableTemplate}
+              disabled={!activeTemplateId}
+              title={activeTemplateId ? "基于当前模板快速新建" : "请先选择一个已有模板"}
+            >
+              复用新建
+            </button>
             <button className="btn ghost" onClick={resetAll}>
               清空
             </button>
@@ -1785,6 +2314,51 @@ export default function App() {
         </section>
 
         <section className="content">
+          {hasProxyView && (
+            <div className="proxy-banner">
+              <div>
+                <strong>已检测到代理合约</strong>
+                <span className="proxy-meta">
+                  合约类型：{proxyInfo?.proxyName || "Proxy"} {"->"}{" "}
+                  {proxyInfo?.implementationName || "Implementation"}
+                </span>
+                <span className="proxy-meta">
+                  当前地址：{contractAddress}
+                </span>
+                <span className="proxy-meta">
+                  实现地址：{proxyInfo?.implementationAddress}
+                </span>
+              </div>
+              {proxyInfo?.implementationAddress && explorerBase && (
+                <a
+                  className="btn ghost tiny-btn"
+                  href={buildExplorerAddressUrl(explorerBase, proxyInfo.implementationAddress)}
+                  target="_blank"
+                  rel="noopener"
+                >
+                  查看实现合约
+                </a>
+              )}
+            </div>
+          )}
+
+          {hasProxyView && (
+            <div className="scope-tabs">
+              <button
+                className={`tab ${activeScope === "contract" ? "active" : ""}`}
+                onClick={() => setActiveScope("contract")}
+              >
+                当前合约
+              </button>
+              <button
+                className={`tab ${activeScope === "proxy" ? "active" : ""}`}
+                onClick={() => setActiveScope("proxy")}
+              >
+                代理实现
+              </button>
+            </div>
+          )}
+
           <div className="tabs">
             <button
               className={`tab ${activeTab === "read" ? "active" : ""}`}
@@ -1801,7 +2375,15 @@ export default function App() {
           </div>
 
           <div className="section-header">
-            <h2>{activeTab === "read" ? "Read 方法" : "Write 方法"}</h2>
+            <h2>
+              {activeScope === "proxy"
+                ? activeTab === "read"
+                  ? "Read As Proxy"
+                  : "Write As Proxy"
+                : activeTab === "read"
+                  ? "Read 方法"
+                  : "Write 方法"}
+            </h2>
             <span className="pill">{activeList.length}</span>
           </div>
 
@@ -1809,7 +2391,11 @@ export default function App() {
             {activeList.length === 0
               ? emptyText
               : activeList.map((fn) => {
-                  const methodStorageKey = buildMethodStorageKey(activeTab, fn);
+                  const methodStorageKey = buildScopedMethodStorageKey(
+                    activeScope,
+                    activeTab,
+                    fn
+                  );
                   return (
                     <MethodCard
                       key={methodStorageKey}
@@ -1828,31 +2414,175 @@ export default function App() {
         </section>
       </main>
 
+      {isImportModalOpen && (
+        <div className="modal-overlay">
+          <div className="modal-card modal-wide">
+            <h3>导入模板</h3>
+
+            <div className="modal-tab-row">
+              <button
+                className={`tab ${importMode === "file" ? "active" : ""}`}
+                type="button"
+                onClick={() => setImportMode("file")}
+              >
+                文件导入
+              </button>
+              <button
+                className={`tab ${importMode === "text" ? "active" : ""}`}
+                type="button"
+                onClick={() => setImportMode("text")}
+              >
+                JSON 文本
+              </button>
+              <button
+                className={`tab ${importMode === "url" ? "active" : ""}`}
+                type="button"
+                onClick={() => setImportMode("url")}
+              >
+                在线 URL
+              </button>
+            </div>
+
+            {importMode === "file" && (
+              <div className="import-panel">
+                <label className="field">
+                  <span>选择一个或多个 JSON 文件</span>
+                  <input
+                    type="file"
+                    accept="application/json,.json"
+                    multiple
+                    onChange={handleImportFiles}
+                    disabled={importBusy}
+                  />
+                </label>
+                <div className="modal-help">支持批量导入，文件内容可为单模板或模板数组。</div>
+              </div>
+            )}
+
+            {importMode === "text" && (
+              <div className="import-panel">
+                <label className="field">
+                  <span>粘贴 JSON 文本</span>
+                  <textarea
+                    rows={14}
+                    value={importJsonText}
+                    placeholder='{"version":1,"templates":[...]}'
+                    onChange={(event) => setImportJsonText(event.target.value)}
+                  ></textarea>
+                </label>
+                <div className="actions">
+                  <button
+                    className="btn primary"
+                    type="button"
+                    onClick={handleImportJsonText}
+                    disabled={!importJsonText.trim()}
+                  >
+                    导入文本
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {importMode === "url" && (
+              <div className="import-panel">
+                <label className="field">
+                  <span>输入在线 JSON 地址</span>
+                  <input
+                    type="text"
+                    value={importUrl}
+                    placeholder="https://example.com/templates.json"
+                    onChange={(event) => setImportUrl(event.target.value)}
+                  />
+                </label>
+                <div className="modal-help">URL 需支持浏览器直接访问，若目标站点未开启 CORS，会导入失败。</div>
+                <div className="actions">
+                  <button
+                    className="btn primary"
+                    type="button"
+                    onClick={handleImportFromUrl}
+                    disabled={importBusy || !importUrl.trim()}
+                  >
+                    {importBusy ? "导入中..." : "从 URL 导入"}
+                  </button>
+                </div>
+              </div>
+            )}
+
+            <div className="actions">
+              <button
+                className="btn ghost"
+                type="button"
+                onClick={() => setIsImportModalOpen(false)}
+              >
+                关闭
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {isExportModalOpen && (
         <div className="modal-overlay">
-          <div className="modal-card">
+          <div className="modal-card modal-wide">
             <h3>导出模板</h3>
-            <button className="link-btn" type="button" onClick={handleToggleExportAll}>
-              全部选择 / 取消全选
-            </button>
 
-            <div className="export-list">
-              {templates.map((template) => (
-                <label className="export-item" key={template.id}>
-                  <input
-                    type="checkbox"
-                    checked={Boolean(exportSelection[template.id])}
-                    onChange={() => handleToggleExportTemplate(template.id)}
-                  />
-                  <span>{template.name}</span>
+            <div className="export-layout">
+              <div className="export-sidebar">
+                <button className="link-btn" type="button" onClick={handleToggleExportAll}>
+                  全部选择 / 取消全选
+                </button>
+
+                <div className="export-list">
+                  {templates.map((template) => (
+                    <label className="export-item" key={template.id}>
+                      <input
+                        type="checkbox"
+                        checked={Boolean(exportSelection[template.id])}
+                        onChange={() => handleToggleExportTemplate(template.id)}
+                      />
+                      <span>{template.name}</span>
+                    </label>
+                  ))}
+                </div>
+              </div>
+
+              <div className="export-preview">
+                <label className="field">
+                  <span>JSON 预览</span>
+                  <textarea
+                    rows={16}
+                    value={exportPreviewText}
+                    readOnly
+                    placeholder="选择模板后，这里会显示导出 JSON。"
+                  ></textarea>
                 </label>
-              ))}
+
+                <div className="actions">
+                  <button className="btn secondary" type="button" onClick={handleCopyExportText}>
+                    复制 JSON
+                  </button>
+                  <button className="btn secondary" type="button" onClick={handleDownloadExportText}>
+                    下载文件
+                  </button>
+                  <button className="btn primary" type="button" onClick={handleConfirmExport}>
+                    导出选中
+                  </button>
+                </div>
+
+                <div className="qr-panel">
+                  <div className="qr-panel-title">二维码</div>
+                  {exportQrDataUrl ? (
+                    <img className="qr-image" src={exportQrDataUrl} alt="export json qr" />
+                  ) : (
+                    <div className="qr-placeholder">
+                      {exportQrError || "选择模板后可生成二维码。"}
+                    </div>
+                  )}
+                </div>
+              </div>
             </div>
 
             <div className="actions">
-              <button className="btn primary" type="button" onClick={handleConfirmExport}>
-                导出选中
-              </button>
               <button
                 className="btn ghost"
                 type="button"
