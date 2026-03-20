@@ -1430,6 +1430,7 @@ export default function App() {
   const [exportQrHint, setExportQrHint] = useState("");
   const [exportQrBusy, setExportQrBusy] = useState(false);
   const [exportCopySuccess, setExportCopySuccess] = useState(false);
+  const [pendingTemplateContractReload, setPendingTemplateContractReload] = useState(false);
 
   const { isConnected, address } = useAccount();
   const walletChainId = useChainId();
@@ -1476,9 +1477,11 @@ export default function App() {
 
         const firstTemplate = insertedTemplates[0];
         applyPanelValues(firstTemplate.panel);
+        clearLoadedContractState();
         setMethodDrafts(cloneMethodStates(firstTemplate.methodStates));
         setTemplateNameInput(firstTemplate.name);
         setActiveTemplateId(firstTemplate.id);
+        setPendingTemplateContractReload(true);
         updateStatus(`已通过二维码导入 ${count} 个模板。`, "success");
       } catch (error) {
         if (cancelled) return;
@@ -1544,6 +1547,29 @@ export default function App() {
       window.clearTimeout(timer);
     };
   }, [exportCopySuccess]);
+
+  useEffect(() => {
+    if (!pendingTemplateContractReload) return undefined;
+
+    setPendingTemplateContractReload(false);
+
+    const hasContract = Boolean(contractAddress.trim());
+    const hasLoadSource = Boolean(abiText.trim() || explorerApi.trim());
+    const hasRpc = Boolean(selectedRpc.trim());
+
+    if (!hasContract || !hasLoadSource || !hasRpc) {
+      return undefined;
+    }
+
+    loadContract();
+    return undefined;
+  }, [
+    pendingTemplateContractReload,
+    contractAddress,
+    abiText,
+    explorerApi,
+    selectedRpc,
+  ]);
 
   useEffect(() => {
     if (!isExportModalOpen || !selectedExportTemplates.length) {
@@ -2151,10 +2177,12 @@ export default function App() {
     if (!template) return;
 
     applyPanelValues(template.panel);
+    clearLoadedContractState();
     setMethodDrafts(cloneMethodStates(template.methodStates));
     setTemplateNameInput(template.name);
     setActiveTemplateId(template.id);
     setIsTemplateMenuOpen(false);
+    setPendingTemplateContractReload(true);
     updateStatus(`已加载模板：${template.name}`, "success");
   };
 
@@ -2408,13 +2436,14 @@ export default function App() {
   };
 
   const handleCopyExportText = async () => {
-    if (!exportPreviewText) {
+    if (!selectedExportTemplates.length) {
       updateStatus("请先选择要导出的模板。", "error");
       return;
     }
 
     try {
-      await navigator.clipboard.writeText(exportPreviewText);
+      const rawExportText = JSON.stringify(buildTemplateExportPayload(selectedExportTemplates));
+      await navigator.clipboard.writeText(rawExportText);
       setExportCopySuccess(true);
       updateStatus("导出 JSON 已复制到剪贴板。", "success");
     } catch (error) {

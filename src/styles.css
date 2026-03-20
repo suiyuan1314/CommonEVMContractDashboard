@@ -643,6 +643,10 @@ select:focus {
   border: 1px solid var(--border);
   border-radius: 14px;
   padding: 18px;
+  max-height: calc(100vh - 36px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
 }
 
 .modal-wide {
@@ -810,6 +814,16 @@ select:focus {
 }
 
 @media (max-width: 560px) {
+  .modal-overlay {
+    align-items: flex-start;
+    padding: 10px;
+  }
+
+  .modal-card {
+    max-height: calc(100vh - 20px);
+    padding: 16px;
+  }
+
   .actions {
     flex-direction: column;
     align-items: stretch;
