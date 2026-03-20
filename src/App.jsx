@@ -14,12 +14,12 @@ import {
 } from "viem";
 
 const DEFAULTS = {
-  rpcList: "https://api.explorer.wardenprotocol.org/api/eth-rpc",
-  chainId: "8765",
-  explorerBase: "https://explorer.wardenprotocol.org/",
-  explorerApi: "https://api.explorer.wardenprotocol.org/api",
+  rpcList: "",
+  chainId: "",
+  explorerBase: "",
+  explorerApi: "",
   explorerApiKey: "",
-  contractAddress: "0xAB5159B5655CdAA5178C283853841aBB0D02Eef9",
+  contractAddress: "",
   abi: "",
 };
 
@@ -27,7 +27,9 @@ const TEMPLATE_STORAGE_KEY = "common-evm-dashboard.templates.v1";
 const TEMPLATE_EXPORT_VERSION = 1;
 const EXPONENT_OPTIONS = [0, 6, 9, 12, 18, 24];
 const SCALE_TYPES = new Set(["uint256", "uint128"]);
-const QR_EXPORT_MAX_LENGTH = 2000;
+const QR_SHARE_MAX_LENGTH = 2950;
+const QR_IMPORT_HASH_KEY = "import";
+const QR_COMPRESSED_TEXT_PREFIX = "CECD1:";
 const KNOWN_PROXY_ABI_BY_NAME = {
   TransparentUpgradeableProxy: [
     {
@@ -456,6 +458,260 @@ function buildTemplateExportPayload(selectedTemplates) {
     exportedAt: getCurrentIsoTime(),
     templates: selectedTemplates,
   };
+}
+
+function compactStringMap(mapLike) {
+  const next = {};
+  Object.entries(mapLike || {}).forEach(([key, value]) => {
+    const normalized = String(value ?? "").trim();
+    if (normalized) {
+      next[key] = normalized;
+    }
+  });
+  return next;
+}
+
+function compactExponentMap(mapLike) {
+  const next = {};
+  Object.entries(mapLike || {}).forEach(([key, value]) => {
+    const normalized = Number(value || 0);
+    if (!Number.isNaN(normalized) && normalized !== 0) {
+      next[key] = normalized;
+    }
+  });
+  return next;
+}
+
+function compactTupleArrayMapForQrShare(tupleArrays) {
+  const next = {};
+
+  Object.entries(tupleArrays || {}).forEach(([key, rows]) => {
+    if (!Array.isArray(rows)) return;
+
+    const compactRows = rows
+      .map((row) => {
+        const values = compactStringMap(row?.values);
+        const exponents = compactExponentMap(row?.exponents);
+        if (!Object.keys(values).length && !Object.keys(exponents).length) {
+          return null;
+        }
+        return { values, exponents };
+      })
+      .filter(Boolean);
+
+    if (compactRows.length) {
+      next[key] = compactRows;
+    }
+  });
+
+  return next;
+}
+
+function compactMethodStateForQrShare(raw) {
+  const safeState = sanitizeMethodState(raw);
+  const values = compactStringMap(safeState.values);
+  const exponents = compactExponentMap(safeState.exponents);
+  const tupleArrays = compactTupleArrayMapForQrShare(safeState.tupleArrays);
+  const payableValue = String(safeState.payableValue || "").trim();
+
+  const next = {};
+  if (Object.keys(values).length) {
+    next.values = values;
+  }
+  if (Object.keys(exponents).length) {
+    next.exponents = exponents;
+  }
+  if (Object.keys(tupleArrays).length) {
+    next.tupleArrays = tupleArrays;
+  }
+  if (payableValue) {
+    next.payableValue = payableValue;
+  }
+
+  return next;
+}
+
+function compactMethodStatesForQrShare(methodStates) {
+  const next = {};
+
+  Object.entries(methodStates || {}).forEach(([methodKey, methodState]) => {
+    const compactState = compactMethodStateForQrShare(methodState);
+    if (Object.keys(compactState).length) {
+      next[methodKey] = compactState;
+    }
+  });
+
+  return next;
+}
+
+function stripTemplateAbiForQrShare(template) {
+  const normalizedPanel = normalizePanelValues(template?.panel);
+  const compactPanel = {};
+
+  Object.entries({
+    rpcListText: normalizedPanel.rpcListText,
+    selectedRpc: normalizedPanel.selectedRpc,
+    explorerBase: normalizedPanel.explorerBase,
+    explorerApi: normalizedPanel.explorerApi,
+    explorerApiKey: normalizedPanel.explorerApiKey,
+    chainId: normalizedPanel.chainId,
+    contractAddress: normalizedPanel.contractAddress,
+  }).forEach(([key, value]) => {
+    const nextValue = String(value || "").trim();
+    if (nextValue) {
+      compactPanel[key] = nextValue;
+    }
+  });
+
+  return {
+    name: String(template?.name || "").trim(),
+    panel: compactPanel,
+    methodStates: compactMethodStatesForQrShare(template?.methodStates),
+  };
+}
+
+function buildQrTemplateExportPayload(selectedTemplates) {
+  return {
+    version: TEMPLATE_EXPORT_VERSION,
+    exportedAt: getCurrentIsoTime(),
+    templates: selectedTemplates.map(stripTemplateAbiForQrShare),
+  };
+}
+
+function supportsCompressedQrShare() {
+  return (
+    typeof CompressionStream !== "undefined" &&
+    typeof DecompressionStream !== "undefined"
+  );
+}
+
+function bytesToBase64Url(bytes) {
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let index = 0; index < bytes.length; index += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(index, index + chunkSize));
+  }
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+function base64UrlToBytes(base64Url) {
+  const base64 = base64Url.replace(/-/g, "+").replace(/_/g, "/");
+  const padded = base64.padEnd(Math.ceil(base64.length / 4) * 4, "=");
+  const binary = atob(padded);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return bytes;
+}
+
+async function compressTextPayload(text) {
+  const stream = new CompressionStream("gzip");
+  const writer = stream.writable.getWriter();
+  await writer.write(new TextEncoder().encode(text));
+  await writer.close();
+  const buffer = await new Response(stream.readable).arrayBuffer();
+  return new Uint8Array(buffer);
+}
+
+async function decompressTextPayload(payload) {
+  const stream = new DecompressionStream("gzip");
+  const writer = stream.writable.getWriter();
+  await writer.write(base64UrlToBytes(payload));
+  await writer.close();
+  const buffer = await new Response(stream.readable).arrayBuffer();
+  return new TextDecoder().decode(buffer);
+}
+
+async function buildCompressedQrShareText(text) {
+  if (!supportsCompressedQrShare()) {
+    throw new Error("当前浏览器不支持压缩二维码分享。");
+  }
+
+  const compressedPayload = bytesToBase64Url(await compressTextPayload(text));
+  return {
+    payload: compressedPayload,
+    qrText: `${QR_COMPRESSED_TEXT_PREFIX}${compressedPayload}`,
+  };
+}
+
+async function resolveQrExportText(text) {
+  const rawText = String(text || "");
+  console.log("[QR_EXPORT_RAW_LENGTH]", rawText.length);
+  console.log("[QR_EXPORT_RAW_TEXT]", rawText);
+
+  if (rawText.length <= QR_SHARE_MAX_LENGTH) {
+    return {
+      qrText: rawText,
+      mode: "raw",
+      payloadLength: rawText.length,
+    };
+  }
+
+  const { payload, qrText } = await withTimeout(
+    buildCompressedQrShareText(rawText),
+    2000,
+    "二维码压缩超时，请检查导出内容是否过大。"
+  );
+
+  if (qrText.length > QR_SHARE_MAX_LENGTH) {
+    throw new Error(
+      `二维码文本仍然过长（原始 ${rawText.length} 字符，压缩后 ${payload.length} 字符），单个二维码无法承载。`
+    );
+  }
+
+  return {
+    qrText,
+    mode: "compressed",
+    payloadLength: payload.length,
+  };
+}
+
+function withTimeout(promise, timeoutMs, errorMessage) {
+  return new Promise((resolve, reject) => {
+    const timer = globalThis.setTimeout(() => {
+      reject(new Error(errorMessage));
+    }, timeoutMs);
+
+    promise
+      .then((value) => {
+        globalThis.clearTimeout(timer);
+        resolve(value);
+      })
+      .catch((error) => {
+        globalThis.clearTimeout(timer);
+        reject(error);
+      });
+  });
+}
+
+function svgToDataUrl(svgMarkup) {
+  return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svgMarkup)}`;
+}
+
+async function normalizeImportedText(text) {
+  const sourceText = String(text || "").trim();
+  if (!sourceText) {
+    throw new Error("未读取到有效模板。");
+  }
+
+  if (sourceText.startsWith(QR_COMPRESSED_TEXT_PREFIX)) {
+    return decompressTextPayload(sourceText.slice(QR_COMPRESSED_TEXT_PREFIX.length));
+  }
+
+  try {
+    const parsedUrl = new URL(sourceText);
+    const hashValue = String(parsedUrl.hash || "").replace(/^#/, "");
+    const params = new URLSearchParams(hashValue);
+    const importPayload = params.get(QR_IMPORT_HASH_KEY);
+    if (importPayload) {
+      return decompressTextPayload(importPayload);
+    }
+  } catch {
+    // not a URL, continue as raw JSON text
+  }
+
+  return sourceText;
 }
 
 function normalizeAbiText(rawAbiText) {
@@ -1171,6 +1427,9 @@ export default function App() {
   const [exportPreviewText, setExportPreviewText] = useState("");
   const [exportQrDataUrl, setExportQrDataUrl] = useState("");
   const [exportQrError, setExportQrError] = useState("");
+  const [exportQrHint, setExportQrHint] = useState("");
+  const [exportQrBusy, setExportQrBusy] = useState(false);
+  const [exportCopySuccess, setExportCopySuccess] = useState(false);
 
   const { isConnected, address } = useAccount();
   const walletChainId = useChainId();
@@ -1186,9 +1445,54 @@ export default function App() {
     () => templates.find((item) => item.id === activeTemplateId) || null,
     [templates, activeTemplateId]
   );
+  const selectedExportTemplates = useMemo(
+    () => templates.filter((template) => exportSelection[template.id]),
+    [exportSelection, templates]
+  );
 
   useEffect(() => {
     setTemplates(loadTemplatesFromStorage());
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return undefined;
+
+    const hashValue = String(window.location.hash || "").replace(/^#/, "");
+    const params = new URLSearchParams(hashValue);
+    const importPayload = params.get(QR_IMPORT_HASH_KEY);
+
+    if (!importPayload) return undefined;
+
+    let cancelled = false;
+
+    (async () => {
+      try {
+        const text = await decompressTextPayload(importPayload);
+        if (cancelled) return;
+
+        const importedTemplates = parseImportedTemplatesFromText(text);
+        const { count, insertedTemplates } = mergeImportedTemplates(importedTemplates);
+        if (cancelled || !count || !insertedTemplates.length) return;
+
+        const firstTemplate = insertedTemplates[0];
+        applyPanelValues(firstTemplate.panel);
+        setMethodDrafts(cloneMethodStates(firstTemplate.methodStates));
+        setTemplateNameInput(firstTemplate.name);
+        setActiveTemplateId(firstTemplate.id);
+        updateStatus(`已通过二维码导入 ${count} 个模板。`, "success");
+      } catch (error) {
+        if (cancelled) return;
+        updateStatus(`二维码导入失败：${error?.message || error}`, "error");
+      } finally {
+        if (!cancelled) {
+          window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}`);
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   useEffect(() => {
@@ -1217,54 +1521,93 @@ export default function App() {
       setExportPreviewText("");
       setExportQrDataUrl("");
       setExportQrError("");
+      setExportQrHint("");
+      setExportQrBusy(false);
+      setExportCopySuccess(false);
       return;
     }
 
-    const selectedTemplates = templates.filter((template) => exportSelection[template.id]);
-    const nextPreview = selectedTemplates.length
-      ? JSON.stringify(buildTemplateExportPayload(selectedTemplates), null, 2)
+    const nextPreview = selectedExportTemplates.length
+      ? JSON.stringify(buildTemplateExportPayload(selectedExportTemplates), null, 2)
       : "";
     setExportPreviewText(nextPreview);
-  }, [exportSelection, isExportModalOpen, templates]);
+  }, [isExportModalOpen, selectedExportTemplates]);
 
   useEffect(() => {
-    if (!isExportModalOpen || !exportPreviewText) {
+    if (!exportCopySuccess) return undefined;
+
+    const timer = window.setTimeout(() => {
+      setExportCopySuccess(false);
+    }, 1800);
+
+    return () => {
+      window.clearTimeout(timer);
+    };
+  }, [exportCopySuccess]);
+
+  useEffect(() => {
+    if (!isExportModalOpen || !selectedExportTemplates.length) {
+      console.log("[QR_EXPORT_EFFECT_IDLE]", {
+        isExportModalOpen,
+        selectedCount: selectedExportTemplates.length,
+      });
       setExportQrDataUrl("");
       setExportQrError("");
+      setExportQrHint("");
+      setExportQrBusy(false);
       return undefined;
     }
 
-    if (exportPreviewText.length > QR_EXPORT_MAX_LENGTH) {
-      setExportQrDataUrl("");
-      setExportQrError(`JSON 文本较长（${exportPreviewText.length} 字符），无法生成单个二维码。`);
-      return undefined;
-    }
+    const qrPayloadText = JSON.stringify(buildQrTemplateExportPayload(selectedExportTemplates));
 
     let cancelled = false;
-    QRCode.toDataURL(exportPreviewText, {
-      errorCorrectionLevel: "M",
-      margin: 1,
-      width: 240,
-      color: {
-        dark: "#f7f3ec",
-        light: "#121a2b",
-      },
-    })
-      .then((url) => {
-        if (cancelled) return;
-        setExportQrDataUrl(url);
+    setExportQrBusy(true);
+    setExportQrDataUrl("");
+    setExportQrError("");
+    console.log("[QR_EXPORT_EFFECT_SELECTED_COUNT]", selectedExportTemplates.length);
+    resolveQrExportText(qrPayloadText)
+      .then(({ qrText, mode, payloadLength }) => {
+        if (cancelled) return null;
+        setExportQrHint(
+          mode === "compressed"
+            ? `二维码不包含 ABI，仅包含面板配置和已保存的方法参数。当前为压缩导入码，可在“JSON 文本导入”中粘贴导入。原始 JSON ${qrPayloadText.length} 字符，压缩载荷 ${payloadLength} 字符。`
+            : `二维码不包含 ABI，仅包含面板配置和已保存的方法参数。当前二维码直接承载 JSON 文本，共 ${payloadLength} 字符。`
+        );
+        console.log("[QR_EXPORT_TEXT_MODE]", mode);
+        console.log("[QR_EXPORT_LENGTH]", qrText.length);
+        console.log("[QR_EXPORT_TEXT]", qrText);
+        return withTimeout(
+          QRCode.toString(qrText, {
+            type: "svg",
+            errorCorrectionLevel: "L",
+            margin: 1,
+            color: {
+              dark: "#f7f3ec",
+              light: "#121a2b",
+            },
+          }),
+          4000,
+          "二维码生成超时，请检查控制台输出的二维码文本。"
+        );
+      })
+      .then((svgMarkup) => {
+        if (cancelled || !svgMarkup) return;
+        setExportQrDataUrl(svgToDataUrl(svgMarkup));
         setExportQrError("");
+        setExportQrBusy(false);
       })
       .catch((error) => {
         if (cancelled) return;
         setExportQrDataUrl("");
+        setExportQrHint("");
         setExportQrError(`二维码生成失败：${error?.message || error}`);
+        setExportQrBusy(false);
       });
 
     return () => {
       cancelled = true;
     };
-  }, [exportPreviewText, isExportModalOpen]);
+  }, [isExportModalOpen, selectedExportTemplates]);
 
   const publicClient = useMemo(() => {
     if (!selectedRpc) return null;
@@ -1478,12 +1821,18 @@ export default function App() {
     return templatesFromPayload;
   };
 
+  const parseImportedTemplatesFromTextAsync = async (text) => {
+    const normalizedText = await normalizeImportedText(text);
+    return parseImportedTemplatesFromText(normalizedText);
+  };
+
   const mergeImportedTemplates = (importedTemplates) => {
     if (!importedTemplates.length) {
       updateStatus("导入失败：未读取到有效模板。", "error");
-      return 0;
+      return { count: 0, insertedTemplates: [] };
     }
 
+    const insertedTemplates = [];
     persistTemplates((prevTemplates) => {
       const usedIds = new Set(prevTemplates.map((item) => item.id));
       const nextTemplates = [...prevTemplates];
@@ -1494,13 +1843,18 @@ export default function App() {
           nextId = generateTemplateId();
         }
         usedIds.add(nextId);
-        nextTemplates.push({ ...template, id: nextId, updatedAt: getCurrentIsoTime() });
+        const nextTemplate = { ...template, id: nextId, updatedAt: getCurrentIsoTime() };
+        insertedTemplates.push(nextTemplate);
+        nextTemplates.push(nextTemplate);
       });
 
       return nextTemplates;
     });
 
-    return importedTemplates.length;
+    return {
+      count: insertedTemplates.length,
+      insertedTemplates,
+    };
   };
 
   const downloadTextFile = (content, filename) => {
@@ -1919,13 +2273,13 @@ export default function App() {
       for (const file of files) {
         try {
           const text = await file.text();
-          importedTemplates.push(...parseImportedTemplatesFromText(text));
+          importedTemplates.push(...(await parseImportedTemplatesFromTextAsync(text)));
         } catch {
           invalidFiles += 1;
         }
       }
 
-      const successCount = mergeImportedTemplates(importedTemplates);
+      const { count: successCount } = mergeImportedTemplates(importedTemplates);
       if (!successCount) return;
 
       const invalidMessage = invalidFiles ? `，${invalidFiles} 个文件解析失败` : "";
@@ -1938,10 +2292,10 @@ export default function App() {
     }
   };
 
-  const handleImportJsonText = () => {
+  const handleImportJsonText = async () => {
     try {
-      const importedTemplates = parseImportedTemplatesFromText(importJsonText.trim());
-      const successCount = mergeImportedTemplates(importedTemplates);
+      const importedTemplates = await parseImportedTemplatesFromTextAsync(importJsonText.trim());
+      const { count: successCount } = mergeImportedTemplates(importedTemplates);
       if (!successCount) return;
 
       setImportJsonText("");
@@ -1961,14 +2315,25 @@ export default function App() {
 
     setImportBusy(true);
     try {
+      const embeddedTemplates = await parseImportedTemplatesFromTextAsync(url).catch(() => null);
+      if (embeddedTemplates?.length) {
+        const { count: successCount } = mergeImportedTemplates(embeddedTemplates);
+        if (!successCount) return;
+
+        setImportUrl("");
+        setIsImportModalOpen(false);
+        updateStatus(`成功导入 ${successCount} 个模板。`, "success");
+        return;
+      }
+
       const response = await fetch(url);
       if (!response.ok) {
         throw new Error("URL 请求失败。请检查地址和跨域设置。");
       }
 
       const text = await response.text();
-      const importedTemplates = parseImportedTemplatesFromText(text);
-      const successCount = mergeImportedTemplates(importedTemplates);
+      const importedTemplates = await parseImportedTemplatesFromTextAsync(text);
+      const { count: successCount } = mergeImportedTemplates(importedTemplates);
       if (!successCount) return;
 
       setImportUrl("");
@@ -2004,10 +2369,14 @@ export default function App() {
   };
 
   const handleToggleExportTemplate = (templateId) => {
-    setExportSelection((prev) => ({
-      ...prev,
-      [templateId]: !prev[templateId],
-    }));
+    setExportSelection((prev) => {
+      const nextSelection = {
+        ...prev,
+        [templateId]: !prev[templateId],
+      };
+      console.log("[QR_EXPORT_SELECTION]", nextSelection);
+      return nextSelection;
+    });
   };
 
   const handleToggleExportAll = () => {
@@ -2018,6 +2387,7 @@ export default function App() {
     templates.forEach((template) => {
       nextSelection[template.id] = !allChecked;
     });
+    console.log("[QR_EXPORT_SELECTION]", nextSelection);
     setExportSelection(nextSelection);
   };
 
@@ -2045,20 +2415,12 @@ export default function App() {
 
     try {
       await navigator.clipboard.writeText(exportPreviewText);
+      setExportCopySuccess(true);
       updateStatus("导出 JSON 已复制到剪贴板。", "success");
     } catch (error) {
+      setExportCopySuccess(false);
       updateStatus(`复制失败：${error?.message || error}`, "error");
     }
-  };
-
-  const handleDownloadExportText = () => {
-    if (!exportPreviewText) {
-      updateStatus("请先选择要导出的模板。", "error");
-      return;
-    }
-
-    downloadTextFile(exportPreviewText, `contract-templates-${Date.now()}.json`);
-    updateStatus("导出 JSON 已下载。", "success");
   };
 
   const resetAll = () => {
@@ -2466,10 +2828,11 @@ export default function App() {
                   <textarea
                     rows={14}
                     value={importJsonText}
-                    placeholder='{"version":1,"templates":[...]}'
+                    placeholder='{"version":1,"templates":[...]} 或 CECD1:xxxxx'
                     onChange={(event) => setImportJsonText(event.target.value)}
                   ></textarea>
                 </label>
+                <div className="modal-help">支持标准 JSON，也支持粘贴二维码扫描得到的压缩导入码。</div>
                 <div className="actions">
                   <button
                     className="btn primary"
@@ -2559,23 +2922,26 @@ export default function App() {
 
                 <div className="actions">
                   <button className="btn secondary" type="button" onClick={handleCopyExportText}>
-                    复制 JSON
-                  </button>
-                  <button className="btn secondary" type="button" onClick={handleDownloadExportText}>
-                    下载文件
+                    {exportCopySuccess ? "已复制" : "复制 JSON"}
                   </button>
                   <button className="btn primary" type="button" onClick={handleConfirmExport}>
                     导出选中
                   </button>
                 </div>
+                {exportCopySuccess ? (
+                  <div className="inline-feedback success">JSON 文本已复制到剪贴板。</div>
+                ) : null}
 
                 <div className="qr-panel">
                   <div className="qr-panel-title">二维码</div>
+                  {exportQrHint ? <div className="qr-panel-hint">{exportQrHint}</div> : null}
                   {exportQrDataUrl ? (
                     <img className="qr-image" src={exportQrDataUrl} alt="export json qr" />
                   ) : (
                     <div className="qr-placeholder">
-                      {exportQrError || "选择模板后可生成二维码。"}
+                      {exportQrBusy
+                        ? "二维码生成中..."
+                        : exportQrError || "选择模板后可生成二维码。"}
                     </div>
                   )}
                 </div>
