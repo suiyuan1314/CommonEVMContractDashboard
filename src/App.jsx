@@ -12,6 +12,10 @@ import {
   isAddress,
   parseEther,
 } from "viem";
+import {
+  getCurrentUnixTimestampSeconds,
+  matchesAutoTimestampParamName,
+} from "./methodParamUtils";
 
 const DEFAULTS = {
   rpcList: "",
@@ -263,12 +267,14 @@ function buildParamNodes(params, path = [], useRelativePath = false) {
   return (params || []).map((param, index) => {
     const currentPath = useRelativePath ? [...path, index] : [...path, index];
     const key = currentPath.join(".");
-    const name = param?.name || `arg${index}`;
+    const abiName = String(param?.name || "");
+    const name = abiName || `arg${index}`;
 
     if (isTupleArrayParam(param)) {
       return {
         kind: "tupleArray",
         key,
+        abiName,
         name,
         type: param.type,
         path: currentPath,
@@ -280,6 +286,7 @@ function buildParamNodes(params, path = [], useRelativePath = false) {
       return {
         kind: "tuple",
         key,
+        abiName,
         name,
         type: param.type,
         path: currentPath,
@@ -290,6 +297,7 @@ function buildParamNodes(params, path = [], useRelativePath = false) {
     return {
       kind: "leaf",
       key,
+      abiName,
       name,
       type: param?.type || "unknown",
       path: currentPath,
@@ -1033,7 +1041,7 @@ function loadTemplatesFromStorage() {
   }
 }
 
-function MethodCard({
+export function MethodCard({
   fn,
   kind,
   explorerBase,
@@ -1237,6 +1245,7 @@ function MethodCard({
     const scopedExponents = rowContext ? rowContext.exponents : fieldExponents;
     const value = scopedValues[node.key] ?? "";
     const exponent = Number(scopedExponents[node.key] || 0);
+    const showTimestampShortcut = matchesAutoTimestampParamName(node.abiName);
 
     const handleScopedValueChange = (nextValue) => {
       if (rowContext) {
@@ -1264,10 +1273,36 @@ function MethodCard({
         <label>
           {displayName} ({node.type})
         </label>
-        {SCALE_TYPES.has(node.type) ? (
-          <div className="input-with-addon">
+        <div className="param-input-row">
+          {SCALE_TYPES.has(node.type) ? (
+            <div className="input-with-addon">
+              <input
+                type="text"
+                aria-label={`${displayName} (${node.type})`}
+                placeholder={
+                  node.type.includes("[]") || node.type.startsWith("tuple")
+                    ? "JSON 格式"
+                    : "输入参数"
+                }
+                value={value}
+                onChange={(event) => handleScopedValueChange(event.target.value)}
+              />
+              <select
+                className="addon-select"
+                value={exponent}
+                onChange={(event) => handleScopedExponentChange(Number(event.target.value))}
+              >
+                {EXPONENT_OPTIONS.map((exp) => (
+                  <option key={exp} value={exp}>
+                    10^{exp}
+                  </option>
+                ))}
+              </select>
+            </div>
+          ) : (
             <input
               type="text"
+              aria-label={`${displayName} (${node.type})`}
               placeholder={
                 node.type.includes("[]") || node.type.startsWith("tuple")
                   ? "JSON 格式"
@@ -1276,30 +1311,20 @@ function MethodCard({
               value={value}
               onChange={(event) => handleScopedValueChange(event.target.value)}
             />
-            <select
-              className="addon-select"
-              value={exponent}
-              onChange={(event) => handleScopedExponentChange(Number(event.target.value))}
+          )}
+
+          {showTimestampShortcut && (
+            <button
+              className="param-shortcut-btn"
+              type="button"
+              aria-label="填入当前秒级时间戳"
+              title="填入当前秒级时间戳"
+              onClick={() => handleScopedValueChange(getCurrentUnixTimestampSeconds())}
             >
-              {EXPONENT_OPTIONS.map((exp) => (
-                <option key={exp} value={exp}>
-                  10^{exp}
-                </option>
-              ))}
-            </select>
-          </div>
-        ) : (
-          <input
-            type="text"
-            placeholder={
-              node.type.includes("[]") || node.type.startsWith("tuple")
-                ? "JSON 格式"
-                : "输入参数"
-            }
-            value={value}
-            onChange={(event) => handleScopedValueChange(event.target.value)}
-          />
-        )}
+              ⏱
+            </button>
+          )}
+        </div>
       </div>
     );
   };
