@@ -19,12 +19,32 @@
     "wagmi": "^2.5.8"
   },
   "devDependencies": {
-    "@testing-library/jest-dom": "^6.9.1",
-    "@testing-library/react": "^16.3.2",
-    "@testing-library/user-event": "^14.6.1",
-    "@vitejs/plugin-react": "^6.0.1",
-    "jsdom": "^29.0.2",
-    "vite": "^8.0.1",
-    "vitest": "^4.1.4"
+    "@testing-library/jest-dom": "6.9.1",
+    "@testing-library/react": "16.3.2",
+    "@testing-library/user-event": "14.6.1",
+    "@vitejs/plugin-react": "6.0.1",
+    "jsdom": "29.0.2",
+    "vite": "8.0.5",
+    "vitest": "4.1.4"
+  },
+  "overrides": {
+    "@coinbase/cdp-sdk": {
+      "axios": "1.15.0"
+    },
+    "h3": {
+      "defu": "6.1.7"
+    },
+    "porto": {
+      "hono": "4.12.12"
+    },
+    "@metamask/utils": {
+      "lodash": "4.18.1"
+    },
+    "anymatch": {
+      "picomatch": "2.3.2"
+    },
+    "tinyglobby": {
+      "picomatch": "4.0.4"
+    }
   }
 }
