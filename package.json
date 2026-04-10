@@ -45,6 +45,7 @@
     },
     "tinyglobby": {
       "picomatch": "4.0.4"
-    }
+    },
+    "@napi-rs/wasm-runtime": "1.1.1"
   }
 }
