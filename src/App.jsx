@@ -16,6 +16,10 @@ import {
   getCurrentUnixTimestampSeconds,
   matchesAutoTimestampParamName,
 } from "./methodParamUtils";
+import {
+  filterTemplatesByName,
+  sortTemplatesByName,
+} from "./templateUtils";
 
 const DEFAULTS = {
   rpcList: "",
@@ -1440,6 +1444,7 @@ export default function App() {
   const [templates, setTemplates] = useState([]);
   const [activeTemplateId, setActiveTemplateId] = useState("");
   const [templateNameInput, setTemplateNameInput] = useState("");
+  const [templateSearchText, setTemplateSearchText] = useState("");
   const [methodDrafts, setMethodDrafts] = useState({});
   const [isTemplateMenuOpen, setIsTemplateMenuOpen] = useState(false);
   const [isImportModalOpen, setIsImportModalOpen] = useState(false);
@@ -1471,8 +1476,14 @@ export default function App() {
     () => templates.find((item) => item.id === activeTemplateId) || null,
     [templates, activeTemplateId]
   );
+  const sortedTemplates = useMemo(() => sortTemplatesByName(templates), [templates]);
+  const filteredTemplateOptions = useMemo(
+    () => filterTemplatesByName(sortedTemplates, templateSearchText),
+    [sortedTemplates, templateSearchText]
+  );
   const selectedExportTemplates = useMemo(
-    () => templates.filter((template) => exportSelection[template.id]),
+    () =>
+      sortTemplatesByName(templates.filter((template) => exportSelection[template.id])),
     [exportSelection, templates]
   );
 
@@ -1542,6 +1553,12 @@ export default function App() {
     return () => {
       document.removeEventListener("mousedown", handleOutsideClick);
     };
+  }, [isTemplateMenuOpen]);
+
+  useEffect(() => {
+    if (!isTemplateMenuOpen) {
+      setTemplateSearchText("");
+    }
   }, [isTemplateMenuOpen]);
 
   useEffect(() => {
@@ -2570,10 +2587,20 @@ export default function App() {
 
               {isTemplateMenuOpen && (
                 <div className="template-menu">
-                  {templates.length === 0 ? (
+                  <input
+                    className="template-search"
+                    type="text"
+                    value={templateSearchText}
+                    placeholder="搜索模板"
+                    onChange={(event) => setTemplateSearchText(event.target.value)}
+                  />
+
+                  {sortedTemplates.length === 0 ? (
                     <div className="template-empty">暂无模板</div>
+                  ) : filteredTemplateOptions.length === 0 ? (
+                    <div className="template-empty">暂无匹配模板</div>
                   ) : (
-                    templates.map((template) => (
+                    filteredTemplateOptions.map((template) => (
                       <div
                         className={`template-item ${template.id === activeTemplateId ? "active" : ""}`}
                         key={template.id}
@@ -2950,7 +2977,7 @@ export default function App() {
                 </button>
 
                 <div className="export-list">
-                  {templates.map((template) => (
+                  {sortedTemplates.map((template) => (
                     <label className="export-item" key={template.id}>
                       <input
                         type="checkbox"
