@@ -16,6 +16,31 @@ import App from "./App.jsx";
 
 const WALLETCONNECT_PROJECT_ID = "dbcb5d45f04c49f7c2fc17db884f11b4";
 
+const robinhoodChain = defineChain({
+  id: 4663,
+  name: "Robinhood",
+  network: "Robinhood Chain",
+  nativeCurrency: {
+    name: "ETH",
+    symbol: "ETH",
+    decimals: 18,
+  },
+  rpcUrls: {
+    default: {
+      http: ["https://rpc.mainnet.chain.robinhood.com"],
+    },
+    public: {
+      http: ["https://robinhood-rpc.publicnode.com"],
+    },
+  },
+  blockExplorers: {
+    default: {
+      name: "Robinhood Explorer",
+      url: "https://robinscan.io/",
+    },
+  },
+});
+
 const wardenChain = defineChain({
   id: 8765,
   name: "Warden",
@@ -52,7 +77,7 @@ const dynamicChains = Object.values(viemChains).filter(
 );
 
 const chainMap = new Map();
-[wardenChain, ...dynamicChains].forEach((chain) => {
+[robinhoodChain, wardenChain, ...dynamicChains].forEach((chain) => {
   if (!chainMap.has(chain.id)) {
     chainMap.set(chain.id, chain);
   }
