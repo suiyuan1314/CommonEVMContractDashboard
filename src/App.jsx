@@ -2101,51 +2101,83 @@ export default function App() {
         throw new Error("未填写 ABI 且未提供浏览器 API 地址。\n请粘贴 ABI 或填写 API 地址。");
       }
 
-      let resolvedAbi = manualAbi;
-      if (!resolvedAbi && explorerApi) {
-        try {
-          resolvedAbi = await fetchContractAbi(contractAddress);
-        } catch {
-          resolvedAbi = extractAbiFromMetadata(contractMetadata);
-        }
+      const isProxyContract = parseExplorerProxyFlag(contractMetadata?.Proxy);
+      const implementationAddress = getImplementationAddressFromMetadata(contractMetadata);
+      const hasProxyImplementation = isProxyContract && implementationAddress;
+
+      // The metadata ABI belongs to the exact address the user entered. Prefer it over
+      // getabi, because some explorer APIs resolve getabi through a detected proxy.
+      let resolvedAbi = manualAbi || extractAbiFromMetadata(contractMetadata);
+      if (!resolvedAbi && explorerApi && !hasProxyImplementation) {
+        resolvedAbi = await fetchContractAbi(contractAddress);
       }
+
+      const loadImplementationContract = async () => {
+        const implementationMetadata = await fetchContractMetadata(implementationAddress);
+        let implementationAbiText = extractAbiFromMetadata(implementationMetadata);
+        if (!implementationAbiText) {
+          implementationAbiText = await fetchContractAbi(implementationAddress);
+        }
+        if (!implementationAbiText) {
+          throw new Error("未能获取实现合约 ABI。");
+        }
+        return { implementationMetadata, implementationAbiText };
+      };
 
       if (!resolvedAbi) {
-        throw new Error("未获取到 ABI。请粘贴 ABI，或确认合约已在浏览器中完成验证。");
-      }
+        if (!hasProxyImplementation) {
+          throw new Error(
+            "未获取到当前合约 ABI。请粘贴 ABI，或确认当前合约已在浏览器中完成验证。"
+          );
+        }
 
-      if (!manualAbi) {
-        setAbiText(resolvedAbi);
+        try {
+          const { implementationMetadata, implementationAbiText } =
+            await loadImplementationContract();
+          const implementationFunctions = parseAbiTextToFunctions(implementationAbiText);
+
+          clearLoadedContractState();
+          setProxyReadFns(implementationFunctions.filter((fn) => isReadFunction(fn)));
+          setProxyWriteFns(implementationFunctions.filter((fn) => !isReadFunction(fn)));
+          setProxyInfo({
+            implementationAddress,
+            implementationName: String(implementationMetadata?.ContractName || "Implementation"),
+            proxyName: String(contractMetadata?.ContractName || "Proxy"),
+          });
+          setActiveScope("proxy");
+          if (!manualAbi) {
+            setAbiText(implementationAbiText);
+          }
+          updateStatus(
+            `代理合约自身 ABI 未开源；已从实现合约 ${implementationAddress} 加载 Read/Write As Proxy 方法。`,
+            "success"
+          );
+          return;
+        } catch (error) {
+          throw new Error(
+            `代理合约自身 ABI 未开源，且实现合约 ABI 加载失败：${error?.message || error}`
+          );
+        }
       }
 
       clearLoadedContractState();
       const functions = parseAbiTextToFunctions(resolvedAbi);
       setReadFns(functions.filter((fn) => isReadFunction(fn)));
       setWriteFns(functions.filter((fn) => !isReadFunction(fn)));
+      if (!manualAbi) {
+        setAbiText(resolvedAbi);
+      }
 
-      const isProxyContract = parseExplorerProxyFlag(contractMetadata?.Proxy);
-      const implementationAddress = getImplementationAddressFromMetadata(contractMetadata);
-
-      if (isProxyContract && implementationAddress) {
+      if (hasProxyImplementation) {
         try {
-          const implementationMetadata = await fetchContractMetadata(implementationAddress);
-          let implementationAbiText = "";
-          try {
-            implementationAbiText = await fetchContractAbi(implementationAddress);
-          } catch {
-            implementationAbiText = extractAbiFromMetadata(implementationMetadata);
-          }
-
-          if (!implementationAbiText) {
-            throw new Error("未能获取实现合约 ABI。");
-          }
+          const { implementationMetadata, implementationAbiText } =
+            await loadImplementationContract();
 
           let proxyFunctions = functions;
-          const currentAbiNormalized = normalizeAbiText(resolvedAbi);
           const implementationAbiNormalized = normalizeAbiText(implementationAbiText);
           let abiNotice = "";
 
-          if (currentAbiNormalized === implementationAbiNormalized) {
+          if (normalizeAbiText(resolvedAbi) === implementationAbiNormalized) {
             const knownProxyFunctions = getKnownProxyFunctions(contractMetadata?.ContractName);
             if (knownProxyFunctions) {
               proxyFunctions = knownProxyFunctions;
@@ -2171,7 +2203,12 @@ export default function App() {
           setActiveScope("proxy");
           statusMessage = `合约已加载完成，检测到代理实现：${implementationAddress}.${abiNotice}`;
         } catch (error) {
-          statusMessage = `合约已加载完成，但代理实现加载失败：${error?.message || error}`;
+          setProxyInfo({
+            implementationAddress,
+            implementationName: "Implementation",
+            proxyName: String(contractMetadata?.ContractName || "Proxy"),
+          });
+          statusMessage = `当前合约 ABI 已加载；关联代理实现 ABI 加载失败，不影响当前合约 Read/Write 方法：${error?.message || error}`;
         }
       } else {
         statusMessage = "合约已加载完成。";
@@ -2508,7 +2545,7 @@ export default function App() {
     updateStatus("已清空。", "");
   };
 
-  const hasProxyView = proxyReadFns.length > 0 || proxyWriteFns.length > 0;
+  const hasProxyView = Boolean(proxyInfo);
   const activeList =
     activeScope === "proxy"
       ? activeTab === "read"
