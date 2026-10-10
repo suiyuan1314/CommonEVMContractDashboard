@@ -1,5 +1,6 @@
+import React from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
 vi.mock("@rainbow-me/rainbowkit", () => ({
@@ -73,6 +74,7 @@ function jsonResponse(payload) {
 describe("App contract ABI loading", () => {
   beforeEach(() => {
     localStorage.clear();
+    window.history.replaceState(null, "", "/");
   });
 
   afterEach(() => {
@@ -224,5 +226,140 @@ describe("App contract ABI loading", () => {
         return url.searchParams.get("action") === "getabi";
       })
     ).toBe(false);
+  });
+});
+
+describe("App URL selection", () => {
+  const storageKey = "common-evm-dashboard.templates.v1";
+  const firstTemplate = {
+    id: "template-a",
+    name: "模板 A",
+    panel: {
+      rpcListText: "https://rpc.example.test",
+      selectedRpc: "https://rpc.example.test",
+      explorerApi: "https://api.example.test/api",
+      contractAddress: CONTRACT_ADDRESS,
+      abiText: JSON.stringify(CURRENT_ABI),
+    },
+    methodStates: {},
+  };
+  const secondTemplate = { ...firstTemplate, id: "template-b", name: "模板 B" };
+
+  beforeEach(() => {
+    window.history.replaceState(null, "", "/");
+    localStorage.clear();
+    localStorage.setItem(storageKey, JSON.stringify([firstTemplate, secondTemplate]));
+    vi.stubGlobal("fetch", vi.fn((rawUrl) => {
+      const url = new URL(rawUrl);
+      const address = url.searchParams.get("address")?.toLowerCase();
+      if (url.searchParams.get("action") !== "getsourcecode") {
+        throw new Error(`Unexpected explorer request: ${url.toString()}`);
+      }
+      if (address === CONTRACT_ADDRESS) {
+        return jsonResponse({
+          status: "1",
+          result: [{
+            ABI: JSON.stringify(CURRENT_ABI),
+            ContractName: "Proxy",
+            Proxy: "1",
+            Implementation: RELATED_ADDRESS,
+          }],
+        });
+      }
+      if (address === RELATED_ADDRESS) {
+        return jsonResponse({
+          status: "1",
+          result: [{
+            ABI: JSON.stringify(IMPLEMENTATION_ABI),
+            ContractName: "Implementation",
+            Proxy: "0",
+          }],
+        });
+      }
+      throw new Error(`Unexpected explorer request: ${url.toString()}`);
+    }));
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+    window.history.replaceState(null, "", "/");
+  });
+
+  it.each([
+    ["read", "Read 方法", "currentRead"],
+    ["write", "Write 方法", "currentWrite"],
+    ["readproxy", "Read As Proxy", "implementationRead"],
+    ["writeproxy", "Write As Proxy", "implementationWrite"],
+  ])("restores the template and %s view after asynchronous proxy loading", async (tab, heading, method) => {
+    window.history.replaceState(
+      { preserved: true }, "", `/?template=template-a&tab=${tab}&other=keep#section`
+    );
+    render(<React.StrictMode><App /></React.StrictMode>);
+
+    await screen.findByText("已检测到代理合约");
+    expect(await screen.findByText(method)).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: heading })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "模板 A" })).toBeInTheDocument();
+    expect(screen.getByLabelText("合约地址")).toHaveValue(CONTRACT_ADDRESS);
+    const url = new URL(window.location.href);
+    expect(url.searchParams.get("template")).toBe("template-a");
+    expect(url.searchParams.get("tab")).toBe(tab);
+    expect(url.searchParams.get("other")).toBe("keep");
+    expect(url.hash).toBe("#section");
+    expect(window.history.state).toEqual({ preserved: true });
+  });
+
+  it("updates the URL on template and scope/tab changes and restores them on remount", async () => {
+    const user = userEvent.setup();
+    const firstRender = render(<App />);
+    await user.click(screen.getByRole("button", { name: "选择模板" }));
+    await user.click(screen.getByRole("button", { name: "模板 A" }));
+    await screen.findByText("implementationRead");
+    expect(new URLSearchParams(window.location.search).get("template")).toBe("template-a");
+    expect(new URLSearchParams(window.location.search).get("tab")).toBe("readproxy");
+
+    await user.click(screen.getByRole("button", { name: "当前合约" }));
+    expect(new URLSearchParams(window.location.search).get("tab")).toBe("read");
+    await user.click(screen.getByRole("button", { name: "Write Contract" }));
+    expect(new URLSearchParams(window.location.search).get("tab")).toBe("write");
+    await user.click(screen.getByRole("button", { name: "代理实现" }));
+    expect(new URLSearchParams(window.location.search).get("tab")).toBe("writeproxy");
+    await user.click(screen.getByRole("button", { name: "模板 A" }));
+    await user.click(screen.getByRole("button", { name: "模板 B" }));
+    await screen.findByText("implementationWrite");
+    expect(new URLSearchParams(window.location.search).get("template")).toBe("template-b");
+    expect(new URLSearchParams(window.location.search).get("tab")).toBe("writeproxy");
+
+    firstRender.unmount();
+    render(<App />);
+    expect(await screen.findByText("implementationWrite")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "模板 B" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Write As Proxy" })).toBeInTheDocument();
+  });
+
+  it("clears the template parameter when the selected template is deleted", async () => {
+    window.history.replaceState(null, "", "/?template=template-a&tab=write");
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findByText("currentWrite");
+    await user.click(screen.getByRole("button", { name: "模板 A" }));
+    const templateRow = screen.getAllByRole("button", { name: "模板 A" })
+      .find((button) => button.className === "template-item-main").closest(".template-item");
+    await user.click(within(templateRow).getByTitle("删除模板"));
+    expect(new URLSearchParams(window.location.search).has("template")).toBe(false);
+    expect(new URLSearchParams(window.location.search).get("tab")).toBe("write");
+    expect(screen.getByRole("button", { name: "选择模板" })).toBeInTheDocument();
+    expect(JSON.parse(localStorage.getItem(storageKey)).map((template) => template.id)).toEqual(["template-b"]);
+  });
+
+  it("reports a missing template instead of loading another one", () => {
+    window.history.replaceState(null, "", "/?template=missing&tab=read");
+    render(<App />);
+    expect(screen.getByText("URL 指定的模板不存在，请先导入模板或重新选择。")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "选择模板" })).toBeInTheDocument();
+    expect(screen.getByLabelText("合约地址")).toHaveValue("");
+    expect(fetch).not.toHaveBeenCalled();
   });
 });

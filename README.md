@@ -15,6 +15,9 @@ Common EVM Contract Dashboard 是一个基于 React 和 Vite 构建的前端项�
 - 支持多种钱包连接
 - 集成 Warden 链自定义配置
 - 合约交互与数据展示
+- 选择模板或切换方法标签页时，自动将选择同步到 URL；刷新页面会恢复模板配置并加载相应方法。
+
+URL 参数示例：`?template=<模板ID>&tab=writeproxy`。`tab` 支持 `read`、`write`、`readproxy`、`writeproxy`。模板内容保存在当前浏览器本地，打开链接的浏览器需要已保存或导入对应模板。
 
 ## 快速开始
 1. 安装依赖：

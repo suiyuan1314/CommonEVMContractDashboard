@@ -32,6 +32,7 @@ const DEFAULTS = {
 };
 
 const TEMPLATE_STORAGE_KEY = "common-evm-dashboard.templates.v1";
+const METHOD_TABS = new Set(["read", "write", "readproxy", "writeproxy"]);
 const TEMPLATE_EXPORT_VERSION = 1;
 const EXPONENT_OPTIONS = [0, 6, 9, 12, 18, 24];
 const SCALE_TYPES = new Set(["uint256", "uint128"]);
@@ -1424,28 +1425,52 @@ export function MethodCard({
 }
 
 export default function App() {
-  const [rpcListText, setRpcListText] = useState(DEFAULTS.rpcList);
-  const [selectedRpc, setSelectedRpc] = useState(DEFAULTS.rpcList);
-  const [explorerBase, setExplorerBase] = useState(DEFAULTS.explorerBase);
-  const [explorerApi, setExplorerApi] = useState(DEFAULTS.explorerApi);
-  const [explorerApiKey, setExplorerApiKey] = useState(DEFAULTS.explorerApiKey);
-  const [chainId, setChainId] = useState(DEFAULTS.chainId);
-  const [contractAddress, setContractAddress] = useState(DEFAULTS.contractAddress);
-  const [abiText, setAbiText] = useState(DEFAULTS.abi);
+  const [initialUrlSelection] = useState(() => {
+    const params = new URLSearchParams(window.location.search);
+    const tab = params.get("tab");
+    const templates = loadTemplatesFromStorage();
+    const templateId = params.get("template") || "";
+    const template = templates.find((item) => item.id === templateId);
+    return {
+      templateId,
+      template,
+      templates,
+      panel: template?.panel || normalizePanelValues({}),
+      tab: METHOD_TABS.has(tab) ? tab : null,
+    };
+  });
+  const [rpcListText, setRpcListText] = useState(initialUrlSelection.panel.rpcListText);
+  const [selectedRpc, setSelectedRpc] = useState(initialUrlSelection.panel.selectedRpc);
+  const [explorerBase, setExplorerBase] = useState(initialUrlSelection.panel.explorerBase);
+  const [explorerApi, setExplorerApi] = useState(initialUrlSelection.panel.explorerApi);
+  const [explorerApiKey, setExplorerApiKey] = useState(initialUrlSelection.panel.explorerApiKey);
+  const [chainId, setChainId] = useState(initialUrlSelection.panel.chainId);
+  const [contractAddress, setContractAddress] = useState(initialUrlSelection.panel.contractAddress);
+  const [abiText, setAbiText] = useState(initialUrlSelection.panel.abiText);
   const [readFns, setReadFns] = useState([]);
   const [writeFns, setWriteFns] = useState([]);
   const [proxyReadFns, setProxyReadFns] = useState([]);
   const [proxyWriteFns, setProxyWriteFns] = useState([]);
   const [proxyInfo, setProxyInfo] = useState(null);
-  const [activeTab, setActiveTab] = useState("read");
-  const [activeScope, setActiveScope] = useState("contract");
-  const [status, setStatus] = useState({ message: "", type: "" });
+  const [activeTab, setActiveTab] = useState(
+    initialUrlSelection.tab?.startsWith("write") ? "write" : "read"
+  );
+  const [activeScope, setActiveScope] = useState(
+    initialUrlSelection.tab?.endsWith("proxy") ? "proxy" : "contract"
+  );
+  const [status, setStatus] = useState(
+    initialUrlSelection.templateId && !initialUrlSelection.template
+      ? { message: "URL 指定的模板不存在，请先导入模板或重新选择。", type: "error" }
+      : { message: "", type: "" }
+  );
 
-  const [templates, setTemplates] = useState([]);
-  const [activeTemplateId, setActiveTemplateId] = useState("");
-  const [templateNameInput, setTemplateNameInput] = useState("");
+  const [templates, setTemplates] = useState(initialUrlSelection.templates);
+  const [activeTemplateId, setActiveTemplateId] = useState(initialUrlSelection.template?.id || "");
+  const [templateNameInput, setTemplateNameInput] = useState(initialUrlSelection.template?.name || "");
   const [templateSearchText, setTemplateSearchText] = useState("");
-  const [methodDrafts, setMethodDrafts] = useState({});
+  const [methodDrafts, setMethodDrafts] = useState(
+    () => cloneMethodStates(initialUrlSelection.template?.methodStates)
+  );
   const [isTemplateMenuOpen, setIsTemplateMenuOpen] = useState(false);
   const [isImportModalOpen, setIsImportModalOpen] = useState(false);
   const [importMode, setImportMode] = useState("file");
@@ -1460,7 +1485,9 @@ export default function App() {
   const [exportQrHint, setExportQrHint] = useState("");
   const [exportQrBusy, setExportQrBusy] = useState(false);
   const [exportCopySuccess, setExportCopySuccess] = useState(false);
-  const [pendingTemplateContractReload, setPendingTemplateContractReload] = useState(false);
+  const [pendingTemplateContractReload, setPendingTemplateContractReload] = useState(
+    Boolean(initialUrlSelection.template)
+  );
 
   const { isConnected, address } = useAccount();
   const walletChainId = useChainId();
@@ -1468,6 +1495,7 @@ export default function App() {
 
   const templateMenuRef = useRef(null);
   const autoSwitchRef = useRef("");
+  const selectedMethodTabRef = useRef(initialUrlSelection.tab);
 
   const rpcOptions = useMemo(() => parseRpcList(rpcListText), [rpcListText]);
   const parsedChainId = useMemo(() => parseChainIdValue(chainId), [chainId]);
@@ -1488,8 +1516,18 @@ export default function App() {
   );
 
   useEffect(() => {
-    setTemplates(loadTemplatesFromStorage());
-  }, []);
+    const url = new URL(window.location.href);
+    if (activeTemplateId) {
+      url.searchParams.set("template", activeTemplateId);
+    } else {
+      url.searchParams.delete("template");
+    }
+    url.searchParams.set("tab", `${activeTab}${activeScope === "proxy" ? "proxy" : ""}`);
+
+    if (url.href !== window.location.href) {
+      window.history.replaceState(window.history.state, "", url.href);
+    }
+  }, [activeTemplateId, activeTab, activeScope]);
 
   useEffect(() => {
     if (typeof window === "undefined") return undefined;
@@ -1693,7 +1731,9 @@ export default function App() {
     setProxyReadFns([]);
     setProxyWriteFns([]);
     setProxyInfo(null);
-    setActiveScope("contract");
+    if (!selectedMethodTabRef.current) {
+      setActiveScope("contract");
+    }
     if (clearDrafts) {
       setMethodDrafts({});
     }
@@ -2144,7 +2184,9 @@ export default function App() {
             implementationName: String(implementationMetadata?.ContractName || "Implementation"),
             proxyName: String(contractMetadata?.ContractName || "Proxy"),
           });
-          setActiveScope("proxy");
+          if (!selectedMethodTabRef.current) {
+            setActiveScope("proxy");
+          }
           if (!manualAbi) {
             setAbiText(implementationAbiText);
           }
@@ -2200,7 +2242,9 @@ export default function App() {
             implementationName: String(implementationMetadata?.ContractName || "Implementation"),
             proxyName: String(contractMetadata?.ContractName || "Proxy"),
           });
-          setActiveScope("proxy");
+          if (!selectedMethodTabRef.current) {
+            setActiveScope("proxy");
+          }
           statusMessage = `合约已加载完成，检测到代理实现：${implementationAddress}.${abiNotice}`;
         } catch (error) {
           setProxyInfo({
@@ -2263,6 +2307,12 @@ export default function App() {
     setIsTemplateMenuOpen(false);
     setPendingTemplateContractReload(true);
     updateStatus(`已加载模板：${template.name}`, "success");
+  };
+
+  const handleSelectMethodTab = (tab, scope) => {
+    selectedMethodTabRef.current = `${tab}${scope === "proxy" ? "proxy" : ""}`;
+    setActiveTab(tab);
+    setActiveScope(scope);
   };
 
   const handleDeleteTemplate = (templateId) => {
@@ -2822,17 +2872,17 @@ export default function App() {
             </div>
           )}
 
-          {hasProxyView && (
+          {(hasProxyView || activeScope === "proxy") && (
             <div className="scope-tabs">
               <button
                 className={`tab ${activeScope === "contract" ? "active" : ""}`}
-                onClick={() => setActiveScope("contract")}
+                onClick={() => handleSelectMethodTab(activeTab, "contract")}
               >
                 当前合约
               </button>
               <button
                 className={`tab ${activeScope === "proxy" ? "active" : ""}`}
-                onClick={() => setActiveScope("proxy")}
+                onClick={() => handleSelectMethodTab(activeTab, "proxy")}
               >
                 代理实现
               </button>
@@ -2842,13 +2892,13 @@ export default function App() {
           <div className="tabs">
             <button
               className={`tab ${activeTab === "read" ? "active" : ""}`}
-              onClick={() => setActiveTab("read")}
+              onClick={() => handleSelectMethodTab("read", activeScope)}
             >
               Read Contract
             </button>
             <button
               className={`tab ${activeTab === "write" ? "active" : ""}`}
-              onClick={() => setActiveTab("write")}
+              onClick={() => handleSelectMethodTab("write", activeScope)}
             >
               Write Contract
             </button>
